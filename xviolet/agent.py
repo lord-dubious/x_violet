@@ -63,10 +63,12 @@ class XVioletAgent:
                 conversation=conversation
             )
 
-    def run(self):
+    def run(self, max_cycles: int = None):
         logger.info("Starting unified agent scheduler...")
         # Initialize next run times
         now = time.time()
+        # Counter for test loop breaking
+        cycles = 0
         next_action = now
         # Post scheduling: immediate first run or randomized interval
         if self.config.post_immediately:
@@ -77,6 +79,11 @@ class XVioletAgent:
             next_post = now + random.uniform(self.config.post_interval_min, self.config.post_interval_max)
         while True:
             now = time.time()
+            # Increment cycle and check max_cycles
+            cycles += 1
+            if max_cycles is not None and cycles >= max_cycles:
+                logger.info(f"Reached max_cycles={max_cycles}, exiting loop.")
+                break
             # Action processing (poll & dispatch) at configured interval
             if self.config.enable_action_processing and now >= next_action:
                 logger.info("Running action processing cycle...")
@@ -118,7 +125,9 @@ class XVioletAgent:
             )
             time.sleep(sleep_interval)
 
+Agent = XVioletAgent  # Alias for compatibility
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    agent = XVioletAgent()
+    agent = Agent()
     agent.run()

@@ -10,8 +10,12 @@ import os
 from dotenv import load_dotenv
 from ..config import config
 from ..persona import Persona
-from google import genai
-from google.genai import types
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
 from .proxy import proxy_manager
 
 # Load environment variables
@@ -88,6 +92,11 @@ class LLMManager:
         Returns:
             The generated text string, or None if generation fails or LLM is disabled.
         """
+        # Skip real generation when dry_run
+        from xviolet.config import config
+        if config.dry_run:
+            logger.info(f"[DRY RUN] generate_text: returning prompt fallback for '{prompt}'")
+            return f"[DRY_RUN] {prompt}"
         if not self.is_enabled:
             logger.error("LLM client is not enabled. Cannot generate text.")
             return None
@@ -129,6 +138,11 @@ class LLMManager:
         """
         Uses Gemini's multimodal API to analyze an image and return a persona-driven summary or tweet suggestion.
         """
+        # Skip real analysis when dry_run
+        from xviolet.config import config
+        if config.dry_run:
+            logger.info(f"[DRY RUN] analyze_image: returning placeholder for '{image_path}'")
+            return f"[DRY_RUN] Image at {image_path}"
         if not self.is_enabled:
             logger.error("LLM client is not enabled. Cannot analyze image.")
             return None

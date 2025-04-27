@@ -19,7 +19,6 @@ dist/
 .idea/
 
 # Environment files
-.env
 
 # OS files
 .DS_Store

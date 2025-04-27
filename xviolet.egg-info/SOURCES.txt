@@ -7,6 +7,7 @@ xviolet/config.py
 xviolet/main.py
 xviolet/media.py
 xviolet/persona.py
+xviolet/sqlite_vec_store.py
 xviolet/storage.py
 xviolet/utils.py
 xviolet.egg-info/PKG-INFO
