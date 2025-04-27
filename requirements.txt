@@ -9,3 +9,4 @@ ruff
 httpx
 httpx_socks
 pytest
+colorlog
