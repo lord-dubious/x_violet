@@ -1,4 +1,3 @@
-
 """
 Proxy Management for x_violet.
 
@@ -48,40 +47,39 @@ class ProxyManager:
 
     def _validate_proxy_string(self):
         """Parses and validates the proxy string."""
+        # Simple validation: ensure it's a socks5 URL with netloc
         if not isinstance(self._proxy_string, str) or not self._proxy_string.strip():
-             logger.error("Proxy string is empty or not a string. Proxy disabled.")
-             self._proxy_string = None
-             self._proxy_dict = None
-             self._validated = False
-             return
-
-        try:
-            parsed = urlparse(self._proxy_string)
-            if parsed.scheme not in ["socks5", "socks5h"]:
-                raise ValueError("Proxy scheme must be socks5 or socks5h")
-            if not parsed.hostname:
-                raise ValueError("Proxy hostname is missing")
-            # Port check might be too strict if default is implied, but good for explicit config
-            # if not parsed.port:
-            #     raise ValueError("Proxy port is missing")
-
-            # Format for requests/httpx
-            self._proxy_dict = {
-                "http://": self._proxy_string,  # httpx uses http:// and https:// keys
-                "https://": self._proxy_string,
-            }
-            self._validated = True
-            # Avoid logging user/pass if present
-            log_url = f"{parsed.scheme}://{parsed.hostname}{(':' + str(parsed.port)) if parsed.port else ''}"
-            logger.info(f"Proxy validated and configured: {log_url}")
-
-        except ValueError as e:
-            logger.error(f"Invalid proxy string format '{self._proxy_string}': {e}. Proxy disabled.")
+            logger.error("Proxy string is empty or not a string. Proxy disabled.")
             self._proxy_string = None
             self._proxy_dict = None
             self._validated = False
+            return
+        try:
+            # Reconstruct URL with auth: host:port:user:pass format if missing '@'
+            raw = self._proxy_string
+            parsed_raw = urlparse(raw)
+            if parsed_raw.scheme.startswith("socks5") and "@" not in raw:
+                # Expect segments: host:port:user:pass:[...]
+                segs = raw.split("://", 1)[1].split(":")
+                if len(segs) >= 4:
+                    host, port, user, password = segs[0], segs[1], segs[2], segs[3]
+                    reconstructed = f"{parsed_raw.scheme}://{user}:{password}@{host}:{port}"
+                    logger.info(f"Reconstructed proxy URL with credentials: {reconstructed}")
+                    self._proxy_string = reconstructed
+            parsed = urlparse(self._proxy_string)
+            if not parsed.scheme.startswith("socks5"):
+                raise ValueError("Proxy scheme must be socks5 or socks5h")
+            if not parsed.netloc:
+                raise ValueError("Proxy netloc missing")
+            # Accept any netloc; route all HTTP/S traffic through this proxy URL
+            self._proxy_dict = {
+                "http://": self._proxy_string,
+                "https://": self._proxy_string,
+            }
+            self._validated = True
+            logger.info(f"Proxy validated and configured: {self._proxy_string}")
         except Exception as e:
-            logger.error(f"Unexpected error parsing proxy string '{self._proxy_string}': {e}. Proxy disabled.")
+            logger.error(f"Invalid proxy string '{self._proxy_string}': {e}. Proxy disabled.")
             self._proxy_string = None
             self._proxy_dict = None
             self._validated = False

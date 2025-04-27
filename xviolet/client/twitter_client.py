@@ -27,8 +27,15 @@ class TwitterClient:
         self._init_lock = asyncio.Lock()
 
     def _load_proxy(self):
-        # Use Twitter-specific proxy if set, else fallback to generic SOCKS5_PROXY
-        proxy_str = self.config.twitter_proxy or self.config.socks5_proxy
+        # Skip proxy and client initialization in dry_run mode
+        if self.config.dry_run:
+            logger.info("[DRY RUN] Skipping proxy and client setup.")
+            self.proxy = None
+            self.client = None
+            return
+        # Use Twitter-specific proxy if set, else use reconstructed SOCKS5_PROXY from proxy_manager
+        from xviolet.provider.proxy import proxy_manager
+        proxy_str = self.config.twitter_proxy or proxy_manager.get_proxy_url()
         if proxy_str:
             logger.info(f"Initializing proxy for Twitter client: {proxy_str}")
             self.proxy = Proxy(proxy_str)
@@ -62,7 +69,9 @@ class TwitterClient:
                 "proxy": self.proxy,
             }
             # Instantiate extended Twikit client with Proxy instance
-            self.client = Client(profile, proxy=self.proxy, user_agent=self.config.twitter_user_agent)
+            from httpx_socks import AsyncProxyTransport
+            transport = AsyncProxyTransport.from_url(self.proxy.url)
+            self.client = Client(profile, proxy=self.proxy, transport=transport, user_agent=self.config.twitter_user_agent)
         else:
             logger.warning("No Twitter proxy configured (TWITTER_PROXY or SOCKS5_PROXY). Proceeding without proxy.")
             self.proxy = None
@@ -101,6 +110,11 @@ class TwitterClient:
             return False
 
     async def login(self):
+        # Skip real login when dry_run to enable offline testing
+        if self.config.dry_run:
+            logger.info("[DRY RUN] Skipping login; marking as logged in.")
+            self.logged_in = True
+            return True
         # Throttle login to avoid bans
         import random
         delay = random.uniform(self.config.auth_delay_min, self.config.auth_delay_max)
@@ -160,6 +174,26 @@ class TwitterClient:
             return True
         except Exception as e:
             logger.error(f"Failed to post tweet: {e}")
+            return False
+
+    async def post_tweet_with_media(self, text: str, media_path: str):
+        """Post a tweet with media attachment (async)."""
+        if self.config.dry_run:
+            logger.info(f"[DRY RUN] Would post media tweet: {text} with media {media_path}")
+            return True
+        if len(text) > self.config.max_tweet_length:
+            logger.warning("Tweet exceeds max length. Truncating.")
+            text = text[:self.config.max_tweet_length]
+        # Rotate proxy before posting
+        self.rotate_proxy_if_bad()
+        try:
+            media_id = await self.client.upload_media(media_path)
+            media_ids = [media_id]
+            tweet = await self.client.create_tweet(text=text, media_ids=media_ids)
+            logger.info(f"Media tweet posted: {tweet}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to post media tweet: {e}")
             return False
 
     async def quote_tweet(self, tweet_id: str, text: str, media_path: str = None):

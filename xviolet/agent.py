@@ -4,6 +4,10 @@ Main agent loop for x_violet: integrates LLM, persona, ActionManager, and Twitte
 - Avoids duplicate interactions using interactions.json
 """
 import logging
+import asyncio
+import time
+import random
+from pathlib import Path
 from xviolet.config import config
 from xviolet.provider.llm import LLMManager
 from xviolet.actions import ActionManager
@@ -20,7 +24,13 @@ class XVioletAgent:
 
     def run_once(self):
         # 1. Fetch timeline/tweets to consider
-        timeline = self.twitter.poll()  # TODO: Should return a list of tweet dicts
+        # Execute the async poll() coroutine to get timeline
+        # Authenticate before polling
+        asyncio.run(self.twitter.login())
+        timeline = asyncio.run(self.twitter.poll())  # TODO: Should return a list of tweet dicts
+        # Limit number of tweets processed per cycle
+        limit = self.config.max_actions_processing
+        timeline = timeline[:limit]
         if not timeline:
             logger.info("No tweets to process.")
             return
@@ -54,11 +64,59 @@ class XVioletAgent:
             )
 
     def run(self):
-        logger.info("Starting agent loop...")
+        logger.info("Starting unified agent scheduler...")
+        # Initialize next run times
+        now = time.time()
+        next_action = now
+        # Post scheduling: immediate first run or randomized interval
+        if self.config.post_immediately:
+            next_post = now
+            # disable immediate flag for subsequent runs
+            self.config.post_immediately = False
+        else:
+            next_post = now + random.uniform(self.config.post_interval_min, self.config.post_interval_max)
         while True:
-            self.run_once()
-            # TODO: Respect config intervals, sleep, etc.
-            break  # Remove this break for real agent loop
+            now = time.time()
+            # Action processing (poll & dispatch) at configured interval
+            if self.config.enable_action_processing and now >= next_action:
+                logger.info("Running action processing cycle...")
+                # Ensure authenticated before polling
+                asyncio.run(self.twitter.login())
+                self.run_once()
+                next_action = now + self.config.action_interval
+            # Post generation at configured interval
+            if self.config.enable_twitter_post_generation and now >= next_post:
+                logger.info("Generating and posting a scheduled tweet...")
+                # Decide between media or text tweet
+                if random.random() < self.config.media_tweet_probability:
+                    # Media tweet flow
+                    media_dir = Path(self.config.media_dir)
+                    media_files = [p for p in media_dir.iterdir() if p.suffix.lower() in ('.jpg','.jpeg','.png','.gif')]
+                    if media_files:
+                        media_path = str(random.choice(media_files))
+                        tweet_text = self.llm.analyze_image(media_path, context_type="post")
+                        if tweet_text:
+                            asyncio.run(self.twitter.post_tweet_with_media(tweet_text, media_path))
+                        else:
+                            text = self.llm.generate_text("Automated tweet from x_violet", context_type="post")
+                            if text:
+                                asyncio.run(self.twitter.post_tweet(text))
+                    else:
+                        logger.warning(f"No media files found in {self.config.media_dir}; posting text tweet.")
+                        text = self.llm.generate_text("Automated tweet from x_violet", context_type="post")
+                        if text:
+                            asyncio.run(self.twitter.post_tweet(text))
+                else:
+                    # Text tweet flow
+                    text = self.llm.generate_text("Automated tweet from x_violet", context_type="post")
+                    if text:
+                        asyncio.run(self.twitter.post_tweet(text))
+                next_post = now + random.uniform(self.config.post_interval_min, self.config.post_interval_max)
+            sleep_interval = random.uniform(
+                self.config.loop_sleep_interval_min,
+                self.config.loop_sleep_interval_max
+            )
+            time.sleep(sleep_interval)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

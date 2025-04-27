@@ -6,3 +6,5 @@ twikit
 twikit_ext
 proxystr
 ruff
+httpx
+httpx_socks

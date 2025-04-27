@@ -86,14 +86,28 @@ class AgentConfig:
 
         # --- Advanced Twitter/Agent Controls ---
         self.enable_twitter_post_generation = self._to_bool(os.getenv("ENABLE_TWITTER_POST_GENERATION", "true"))
-        self.post_interval_min = int(os.getenv("POST_INTERVAL_MIN", "120"))
-        self.post_interval_max = int(os.getenv("POST_INTERVAL_MAX", "600"))
+        self.post_interval_min = int(os.getenv("POST_INTERVAL_MIN", "120")) * 60  # minutes -> seconds
+        self.post_interval_max = int(os.getenv("POST_INTERVAL_MAX", "600")) * 60
         self.enable_action_processing = self._to_bool(os.getenv("ENABLE_ACTION_PROCESSING", "true"))
-        self.action_interval = int(os.getenv("ACTION_INTERVAL", "60"))
+        # Action processing interval in minutes -> seconds
+        self.action_interval = int(os.getenv("ACTION_INTERVAL", "60")) * 60
         self.post_immediately = self._to_bool(os.getenv("POST_IMMEDIATELY", "false"))
         self.twitter_spaces_enable = self._to_bool(os.getenv("TWITTER_SPACES_ENABLE", "false"))
         self.max_actions_processing = int(os.getenv("MAX_ACTIONS_PROCESSING", "5"))
         self.action_timeline_type = os.getenv("ACTION_TIMELINE_TYPE", "home")
+        # Media posting probability (0-1) and directory
+        self.media_tweet_probability = float(os.getenv("MEDIA_TWEET_PROBABILITY", "0.3"))
+        self.media_dir = os.getenv("MEDIA_DIR", "media")
+        # Configure scheduler busy loop sleep interval (min/max)
+        loop_min = os.getenv("LOOP_SLEEP_INTERVAL_MIN")
+        loop_max = os.getenv("LOOP_SLEEP_INTERVAL_MAX")
+        if loop_min is not None and loop_max is not None:
+            self.loop_sleep_interval_min = float(loop_min)
+            self.loop_sleep_interval_max = float(loop_max)
+        else:
+            default = float(os.getenv("LOOP_SLEEP_INTERVAL", "1"))
+            self.loop_sleep_interval_min = default
+            self.loop_sleep_interval_max = default
 
     def _to_bool(self, value: str) -> bool:
         return value.strip().lower() in ("1", "true", "yes", "on")
