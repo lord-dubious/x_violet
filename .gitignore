@@ -1,0 +1,38 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution and build
+build/
+dist/
+*.egg-info/
+
+# VSCode
+.vscode/
+
+# IDE settings
+.idea/
+
+# Environment files
+.env
+
+# OS files
+.DS_Store
+
+# Large artifacts
+x_violet.zip
+
+# Logs and SQLite
+*.log
+*.sqlite
+
+# Cache
+pip-wheel-metadata/
+
+# Pytest cache
+.pytest_cache/
