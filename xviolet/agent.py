@@ -21,13 +21,16 @@ class XVioletAgent:
         self.llm = LLMManager()
         self.twitter = TwitterClient()
         self.actions = ActionManager(self.twitter)
+        # Use dedicated event loop to avoid nested asyncio.run issues
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
 
     def run_once(self):
         # 1. Fetch timeline/tweets to consider
         # Execute the async poll() coroutine to get timeline
         # Authenticate before polling
-        asyncio.run(self.twitter.login())
-        timeline = asyncio.run(self.twitter.poll())  # TODO: Should return a list of tweet dicts
+        self.loop.run_until_complete(self.twitter.login())
+        timeline = self.loop.run_until_complete(self.twitter.poll())  # TODO: Should return a list of tweet dicts
         # Limit number of tweets processed per cycle
         limit = self.config.max_actions_processing
         timeline = timeline[:limit]
@@ -88,7 +91,7 @@ class XVioletAgent:
             if self.config.enable_action_processing and now >= next_action:
                 logger.info("Running action processing cycle...")
                 # Ensure authenticated before polling
-                asyncio.run(self.twitter.login())
+                self.loop.run_until_complete(self.twitter.login())
                 self.run_once()
                 next_action = now + self.config.action_interval
             # Post generation at configured interval
@@ -103,21 +106,23 @@ class XVioletAgent:
                         media_path = str(random.choice(media_files))
                         tweet_text = self.llm.analyze_image(media_path, context_type="post")
                         if tweet_text:
-                            asyncio.run(self.twitter.post_tweet_with_media(tweet_text, media_path))
+                            self.loop.run_until_complete(
+                                self.twitter.post_tweet_with_media(tweet_text, media_path)
+                            )
                         else:
                             text = self.llm.generate_text("Automated tweet from x_violet", context_type="post")
                             if text:
-                                asyncio.run(self.twitter.post_tweet(text))
+                                self.loop.run_until_complete(self.twitter.post_tweet(text))
                     else:
                         logger.warning(f"No media files found in {self.config.media_dir}; posting text tweet.")
                         text = self.llm.generate_text("Automated tweet from x_violet", context_type="post")
                         if text:
-                            asyncio.run(self.twitter.post_tweet(text))
+                            self.loop.run_until_complete(self.twitter.post_tweet(text))
                 else:
                     # Text tweet flow
                     text = self.llm.generate_text("Automated tweet from x_violet", context_type="post")
                     if text:
-                        asyncio.run(self.twitter.post_tweet(text))
+                        self.loop.run_until_complete(self.twitter.post_tweet(text))
                 next_post = now + random.uniform(self.config.post_interval_min, self.config.post_interval_max)
             sleep_interval = random.uniform(
                 self.config.loop_sleep_interval_min,

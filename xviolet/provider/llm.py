@@ -82,17 +82,7 @@ class LLMManager:
     def generate_text(self, prompt: str, context_type: str = "chat", **generation_kwargs) -> str | None:
         """
         Generates text using the configured Gemini model, prepending persona context.
-
-        Args:
-            prompt: The user's prompt or the core task for the LLM.
-            context_type: 'chat' or 'post' to fetch appropriate persona context/examples.
-            **generation_kwargs: Additional arguments for the generation config
-                                (e.g., temperature, max_output_tokens).
-
-        Returns:
-            The generated text string, or None if generation fails or LLM is disabled.
         """
-        # Skip real generation when dry_run
         from xviolet.config import config
         if config.dry_run:
             logger.info(f"[DRY RUN] generate_text: returning prompt fallback for '{prompt}'")
@@ -101,28 +91,25 @@ class LLMManager:
             logger.error("LLM client is not enabled. Cannot generate text.")
             return None
 
-        full_prompt = prompt # Default if no persona
+        full_prompt = prompt
         if self.persona:
             persona_context = self.persona.get_full_context_for_llm(context_type=context_type)
-            # Combine persona context with the specific prompt
             full_prompt = f"{persona_context}\n\n---\n\n**Current Task/Prompt:**\n{prompt}"
-            logger.debug(f"Generating text with full prompt (persona context type: {context_type}):\n{full_prompt[:500]}...") # Log beginning of prompt
+            logger.debug(f"Generating text with full prompt (persona context type: {context_type}):\n{full_prompt[:500]}...")
         else:
-             logger.debug("Generating text with prompt (no persona):\n%s...", prompt[:500])
+            logger.debug("Generating text with prompt (no persona):\n%s...", prompt[:500])
 
-        # Default generation config - override with kwargs
-        llm_config = {
+        generation_config = {
             "temperature": 0.7,
             "top_p": 0.95,
             "top_k": 40,
-            # "max_output_tokens": 1024, # Optional: Set max length if needed
         }
-        llm_config.update(generation_kwargs)
+        generation_config.update(generation_kwargs)
         try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=full_prompt,
-                config=llm_config
+            model = genai.GenerativeModel(self.model_name)
+            response = model.generate_content(
+                full_prompt,
+                generation_config=generation_config
             )
             if hasattr(response, 'text') and response.text:
                 logger.info(f"LLM generated text successfully (length: {len(response.text)}).")
@@ -138,7 +125,6 @@ class LLMManager:
         """
         Uses Gemini's multimodal API to analyze an image and return a persona-driven summary or tweet suggestion.
         """
-        # Skip real analysis when dry_run
         from xviolet.config import config
         if config.dry_run:
             logger.info(f"[DRY RUN] analyze_image: returning placeholder for '{image_path}'")
@@ -151,15 +137,16 @@ class LLMManager:
             persona_context = self.persona.get_full_context_for_llm(context_type=context_type)
             full_prompt = f"{persona_context}\n\n---\n\n**Current Task/Prompt:**\n{full_prompt}"
         model_name = vision_model or self.model_name
-        llm_config = {"model": model_name}
-        llm_config.update(generation_kwargs)
+        generation_config = {}
+        generation_config.update(generation_kwargs)
         try:
+            model = genai.GenerativeModel(model_name)
             with open(image_path, "rb") as f:
                 image_bytes = f.read()
-            response = self.client.models.generate_content(
-                model=model_name,
-                contents=[types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"), full_prompt],
-                config=config
+            image_part = genai.types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+            response = model.generate_content(
+                [image_part, full_prompt],
+                generation_config=generation_config
             )
             if hasattr(response, 'text') and response.text:
                 return response.text.strip()
@@ -180,21 +167,20 @@ class LLMManager:
             persona_context = self.persona.get_full_context_for_llm(context_type=context_type)
             full_prompt = f"{persona_context}\n\n---\n\n**Current Task/Prompt:**\n{full_prompt}"
         model_name = vision_model or self.model_name
-        config = {"model": model_name}
+        generation_config = {}
         if response_mime_type:
-            config['response_mime_type'] = response_mime_type
-        config.update(generation_kwargs)
+            generation_config['response_mime_type'] = response_mime_type
+        generation_config.update(generation_kwargs)
         try:
+            model = genai.GenerativeModel(model_name)
             with open(video_path, "rb") as f:
                 video_bytes = f.read()
-            response = self.client.models.generate_content(
-                model=model_name,
-                contents=[types.Part(
-                    inline_data=types.Blob(data=video_bytes, mime_type='video/mp4')
-                ),
-                types.Part(text=full_prompt)
-                ],
-                config=config
+            video_part = genai.types.Part(
+                inline_data=genai.types.Blob(data=video_bytes, mime_type='video/mp4')
+            )
+            response = model.generate_content(
+                [video_part, full_prompt],
+                generation_config=generation_config
             )
             if hasattr(response, 'text') and response.text:
                 return response.text.strip()
@@ -215,17 +201,17 @@ class LLMManager:
             persona_context = self.persona.get_full_context_for_llm(context_type=context_type)
             full_prompt = f"{persona_context}\n\n---\n\n**Current Task/Prompt:**\n{prompt}"
         model_name = model_name or self.model_name
-        llm_config = {"model": model_name}
+        generation_config = {}
         if response_mime_type:
-            llm_config['response_mime_type'] = response_mime_type
+            generation_config['response_mime_type'] = response_mime_type
         if schema:
-            llm_config['response_schema'] = schema
-        llm_config.update(generation_kwargs)
+            generation_config['response_schema'] = schema
+        generation_config.update(generation_kwargs)
         try:
-            response = self.client.models.generate_content(
-                model=model_name,
-                contents=full_prompt,
-                config=llm_config
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(
+                full_prompt,
+                generation_config=generation_config
             )
             import json
             text = response.text.strip() if response and response.text else ""
@@ -240,50 +226,55 @@ class LLMManager:
             logger.error(f"Error during structured output generation: {e}")
             return None
 
+    def embed_text(self, text: str, model_name: str = None, dimensions: int = None) -> list | None:
         """
-        Generates text using the configured Gemini model, prepending persona context.
-
-        Args:
-            prompt: The user's prompt or the core task for the LLM.
-            context_type: 'chat' or 'post' to fetch appropriate persona context/examples.
-            **generation_kwargs: Additional arguments for the generation config
-                                (e.g., temperature, max_output_tokens).
-
-        Returns:
-            The generated text string, or None if generation fails or LLM is disabled.
+        Uses Gemini's embedding API to embed a text string.
         """
         if not self.is_enabled:
-            logger.error("LLM client is not enabled. Cannot generate text.")
+            logger.error("LLM client is not enabled. Cannot embed text.")
             return None
-
-        full_prompt = prompt # Default if no persona
-        if self.persona:
-            persona_context = self.persona.get_full_context_for_llm(context_type=context_type)
-            # Combine persona context with the specific prompt
-            full_prompt = f"{persona_context}\n\n---\n\n**Current Task/Prompt:**\n{prompt}"
-            logger.debug(f"Generating text with full prompt (persona context type: {context_type}):\n{full_prompt[:500]}...") # Log beginning of prompt
-        else:
-             logger.debug("Generating text with prompt (no persona):\n%s...", prompt[:500])
-
-        # Default generation config - override with kwargs
-        config = {
-            "temperature": 0.7,
-            "top_p": 0.95,
-            "top_k": 40,
-            # "max_output_tokens": 1024, # Optional: Set max length if needed
-        }
-        llm_config.update(generation_kwargs)
-
+        model_name = model_name or self.model_name
+        dimensions = dimensions or int(os.getenv("GEMINI_EMBED_DIM", 768))
         try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=full_prompt,
-                config=config
+            model = genai.GenerativeModel(model_name)
+            response = model.embed_content(
+                content=text,
+                task_type="RETRIEVAL_QUERY",
+                title="tweet",
+                dimensions=dimensions
             )
-            if hasattr(response, 'text') and response.text:
-                logger.info(f"LLM generated text successfully (length: {len(response.text)}).")
-                return response.text.strip()
+            if hasattr(response, 'embedding'):
+                return response.embedding
+            logger.warning("No embedding returned.")
             return None
         except Exception as e:
-            logger.error(f"Error during LLM text generation: {e}")
+            logger.error(f"Error during text embedding: {e}")
+            return None
+
+    def embed_image(self, image_path: str, model_name: str = None, dimensions: int = None) -> list | None:
+        """
+        Uses Gemini's embedding API to embed an image.
+        """
+        if not self.is_enabled:
+            logger.error("LLM client is not enabled. Cannot embed image.")
+            return None
+        model_name = model_name or self.model_name
+        dimensions = dimensions or int(os.getenv("GEMINI_EMBED_DIM", 768))
+        try:
+            model = genai.GenerativeModel(model_name)
+            with open(image_path, "rb") as f:
+                image_bytes = f.read()
+            image_part = genai.types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+            response = model.embed_content(
+                content=image_part,
+                task_type="RETRIEVAL_DOCUMENT",
+                title="image",
+                dimensions=dimensions
+            )
+            if hasattr(response, 'embedding'):
+                return response.embedding
+            logger.warning("No embedding returned for image.")
+            return None
+        except Exception as e:
+            logger.error(f"Error during image embedding: {e}")
             return None

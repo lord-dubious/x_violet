@@ -72,6 +72,9 @@ class AgentConfig:
 
         # --- Twitter Session/Cookie ---
         self.cookie_file = os.getenv("TWITTER_COOKIE_FILE", "cookies/cookies.json")
+        # --- Authentication flow controls ---
+        # Whether to attempt cookie-based fallback after credential login
+        self.use_cookies = self._to_bool(os.getenv("TWITTER_USE_COOKIES", "true"))
         # Ensure user_agent retains default if not set
         self.twitter_user_agent = os.getenv("TWITTER_USER_AGENT", self.user_agent)
         self.twitter_proxy = os.getenv("TWITTER_PROXY", "")

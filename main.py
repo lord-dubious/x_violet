@@ -9,14 +9,16 @@ from xviolet.agent import Agent
 
 
 def setup_logging():
+    # Configure root logger with colorized output
+    root = logging.getLogger()
+    root.handlers.clear()
     handler = colorlog.StreamHandler()
     handler.setFormatter(colorlog.ColoredFormatter(
         "%(log_color)s%(asctime)s | %(name)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     ))
-    logger = colorlog.getLogger()
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
 
 
 def main():

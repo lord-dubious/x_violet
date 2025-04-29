@@ -10,3 +10,6 @@ httpx
 httpx_socks
 pytest
 colorlog
+sqlite-vec
+sqlite-rembed
+

@@ -5,3 +5,10 @@ import sys
 root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
+
+# Configure colored logging for tests
+try:
+    from main import setup_logging
+    setup_logging()
+except ImportError:
+    pass
