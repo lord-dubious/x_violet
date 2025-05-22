@@ -13,10 +13,31 @@ Exposes a single AgentConfig object for all modules to use.
 import os
 from dotenv import load_dotenv
 from typing import List
+import json # Added json import
+import logging # Added logging import
 
 load_dotenv()
 
+logger = logging.getLogger(__name__) # Added module-level logger
+
 class AgentConfig:
+    # Define default here for clarity or inside __init__ if preferred
+    DEFAULT_LOCAL_DB_PATH = "data/vector_store.db" # Default path for the primary local store
+    DEFAULT_VECTOR_STORE_CONFIGS = [
+        {
+            'name': 'local_default',
+            'type': 'local',
+            'config': {'db_path': os.getenv("LOCAL_VECTOR_DB_PATH", DEFAULT_LOCAL_DB_PATH)}
+        },
+        # { # Example of a disabled remote store configuration for structure demonstration
+        #     'name': 'remote_disabled_placeholder',
+        #     'type': 'remote',
+        #     'enabled': False, 
+        #     'config': {'api_key': os.getenv("REMOTE_VECTOR_STORE_API_KEY", "YOUR_REMOTE_API_KEY_HERE_OR_ENV"), 
+        #                'index_name': 'default_placeholder_index'}
+        # }
+    ]
+
     """
     Centralized config loader for all agent modules.
     Loads env vars, applies defaults, and type conversion.
@@ -115,6 +136,33 @@ class AgentConfig:
         # --- Scheduled Tweet Limits ---
         self.max_scheduled_tweets_total = int(os.getenv("MAX_SCHEDULED_TWEETS_TOTAL", "5"))
         self.max_scheduled_media_tweets = int(os.getenv("MAX_SCHEDULED_MEDIA_TWEETS", "2"))
+
+        # --- Vector Store Configuration ---
+        raw_vector_store_configs_json = os.getenv("VECTOR_STORE_CONFIGS_JSON")
+        if raw_vector_store_configs_json:
+            try:
+                # Attempt to parse the JSON string from the environment variable
+                parsed_configs = json.loads(raw_vector_store_configs_json)
+                if isinstance(parsed_configs, list):
+                    self.vector_store_configs = parsed_configs
+                    logger.info(f"Loaded vector store configurations from VECTOR_STORE_CONFIGS_JSON: {self.vector_store_configs}")
+                else:
+                    logger.error("VECTOR_STORE_CONFIGS_JSON did not contain a valid JSON list. Using default vector store configuration.")
+                    self.vector_store_configs = list(self.DEFAULT_VECTOR_STORE_CONFIGS) # Use a copy
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in VECTOR_STORE_CONFIGS_JSON: {e}. Using default vector store configuration.")
+                self.vector_store_configs = list(self.DEFAULT_VECTOR_STORE_CONFIGS) # Use a copy
+        else:
+            logger.info("VECTOR_STORE_CONFIGS_JSON not set. Using default vector store configuration.")
+            self.vector_store_configs = list(self.DEFAULT_VECTOR_STORE_CONFIGS) # Use a copy
+
+        # Ensure there's at least one config, or log a warning if it's empty after processing.
+        # This might happen if JSON is `[]`.
+        if not self.vector_store_configs:
+            logger.warning("No vector store configurations loaded or defined. Vector store functionality may be limited.")
+            # Optionally, re-add defaults if empty list from JSON is considered invalid.
+            # self.vector_store_configs = list(self.DEFAULT_VECTOR_STORE_CONFIGS)
+
 
     def _to_bool(self, value: str) -> bool:
         return value.strip().lower() in ("1", "true", "yes", "on")

@@ -14,6 +14,7 @@ from xviolet.provider.llm import LLMManager
 from xviolet.actions import ActionManager
 from xviolet.client.twitter_client import TwitterClient
 from xviolet.media_tracker import load_used_media, mark_media_as_used, is_media_used # Added media_tracker imports
+from xviolet.vector.fallback_manager import VectorStoreFallbackManager # Added VDB Manager import
 
 logger = logging.getLogger("xviolet.agent")
 
@@ -24,16 +25,27 @@ class XVioletAgent:
         self.twitter = TwitterClient()
         self.actions = ActionManager(self.twitter)
         self.used_media_set = load_used_media() # Initialize used_media_set
+        
+        try:
+            logger.info("Initializing VectorStoreFallbackManager...")
+            # AgentConfig stores the list of dicts in self.config.vector_store_configs
+            # The manager expects a dict with 'store_configs_list' key
+            manager_init_config = {'store_configs_list': self.config.vector_store_configs}
+            self.vector_store_manager = VectorStoreFallbackManager(manager_init_config)
+            logger.info("VectorStoreFallbackManager initialized successfully.")
+        except Exception as e: 
+            logger.error(f"Failed to initialize VectorStoreFallbackManager: {e}", exc_info=True)
+            self.vector_store_manager = None 
+
         # Use dedicated event loop to avoid nested asyncio.run issues
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
 
-    def run_once(self):
+    async def run_once(self): # MODIFIED: Changed to async def
         # 1. Fetch timeline/tweets to consider
-        # Execute the async poll() coroutine to get timeline
-        # Authenticate before polling
-        self.loop.run_until_complete(self.twitter.login())
-        timeline = self.loop.run_until_complete(self.twitter.poll())  # TODO: Should return a list of tweet dicts
+        # Authenticate before polling - login() is async, so await it
+        await self.twitter.login() # MODIFIED: Direct await
+        timeline = await self.twitter.poll() # MODIFIED: Direct await
         # Limit number of tweets processed per cycle
         limit = self.config.max_actions_processing
         timeline = timeline[:limit]
@@ -106,6 +118,24 @@ class XVioletAgent:
                     media_path=processed_tweet_data['media_path'], # Use media_path from processed data
                     conversation=processed_tweet_data['conversation'] # Use conversation flag from processed data
                 )
+
+                # Add processed tweet to vector store
+                if self.vector_store_manager and processed_tweet_data.get('id') and processed_tweet_data.get('text'):
+                    try:
+                        document_to_add = {
+                            "id": processed_tweet_data['id'], 
+                            "text": processed_tweet_data['text']
+                            # Potentially add more metadata from processed_tweet_data if store supports it
+                        }
+                        logger.debug(f"Adding document to vector store: {document_to_add['id']}")
+                        added_ids = await self.vector_store_manager.add_documents([document_to_add])
+                        if added_ids and processed_tweet_data['id'] in added_ids:
+                            logger.info(f"Successfully added tweet {processed_tweet_data['id']} to vector store.")
+                        else:
+                             logger.warning(f"Failed to confirm addition of tweet {processed_tweet_data['id']} to vector store. Returned IDs: {added_ids}")
+                    except Exception as e_vs_add:
+                        logger.error(f"Error adding document {processed_tweet_data.get('id')} to vector store: {e_vs_add}", exc_info=True)
+
             except AttributeError as e:
                 logger.error(f"Error processing tweet object attributes: {e}. Tweet Obj: {tweet_obj}")
                 continue # Skip this tweet or handle error
@@ -138,13 +168,34 @@ class XVioletAgent:
             # Action processing (poll & dispatch) at configured interval
             if self.config.enable_action_processing and now >= next_action:
                 logger.info("Running action processing cycle...")
-                # Ensure authenticated before polling
-                self.loop.run_until_complete(self.twitter.login())
-                self.run_once()
+                # self.twitter.login() is now called inside async run_once
+                self.loop.run_until_complete(self.run_once()) # MODIFIED: Call async run_once
                 next_action = now + self.config.action_interval
+            
             # Post generation at configured interval
             if self.config.enable_twitter_post_generation and now >= next_post:
-                logger.info("Starting post generation and scheduling cycle...")
+                logger.info("Starting post generation and scheduling cycle...") # Log tweaked in example, kept as is.
+                
+                # POC: Vector Store Search (before individual tweet generation loop)
+                if self.vector_store_manager:
+                    poc_query_text = "relevant context for new tweets" 
+                    try:
+                        logger.debug(f"Searching vector store with POC query: '{poc_query_text}'")
+                        # Wrap async search call for sync loop
+                        retrieved_docs = self.loop.run_until_complete(
+                            # For LocalVectorStore, query_text is passed directly.
+                            # For FallbackManager, search method handles the text query for local store.
+                            self.vector_store_manager.search(query_embedding=poc_query_text, top_k=2)
+                        )
+                        if retrieved_docs:
+                            logger.info(f"Retrieved {len(retrieved_docs)} docs from VS for POC query '{poc_query_text}':")
+                            for doc_vs in retrieved_docs:
+                                logger.info(f"  - ID: {doc_vs.get('id')}, Score: {doc_vs.get('score')}, Text: {doc_vs.get('text', '')[:100]}...")
+                        else:
+                            logger.info(f"No documents found in VS for POC query: '{poc_query_text}'")
+                    except Exception as e_vs_search:
+                        logger.error(f"Error searching vector store during POC: {e_vs_search}", exc_info=True)
+
                 scheduled_in_cycle_count = 0
                 media_scheduled_in_cycle_count = 0
                 
