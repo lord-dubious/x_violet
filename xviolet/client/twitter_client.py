@@ -87,9 +87,9 @@ class TwitterClient:
         }
         # Local import of Twikit Client to avoid top-level import issues
         try:
-            from twikit_ext.client.client import Client
+            from twikit.client import Client
         except ImportError as e:
-            logger.error(f"Could not import twikit_ext.client.client.Client: {e}")
+            logger.error(f"Could not import twikit.client.Client: {e}")
             raise
         # Instantiate Twikit client
         if self.proxy:
@@ -178,10 +178,18 @@ class TwitterClient:
                 try:
                     await self.rotate_proxy_if_bad()
                     # Re-instantiate client with only auth_token for max stealth
-                    from twikit_ext.client.client import Client
-                    self.client = Client({'auth_token': auth_token})
-                    await self.client.connect()
-                    user = await self.client.user()
+                    from twikit.client import Client
+                    # twikit.Client instantiation is different. It doesn't take a profile dict.
+                    # Cookies are loaded using client.load_cookies() or during login.
+                    self.client = Client(
+                        language='en-US', # Default language
+                        proxy=self.proxy.url if self.proxy else None, # Pass proxy URL directly
+                        user_agent=self.config.twitter_user_agent
+                    )
+                    if auth_token: # Load auth_token if available
+                        self.client.load_cookies({'auth_token': auth_token})
+                    await self.client.connect() # This might still be valid or might be part of login
+                    user = await self.client.get_me() # Common method name for getting user info
                     self.logged_in = True
                     logger.info(f"Login successful via auth_token: {user}")
                     return True
@@ -207,10 +215,15 @@ class TwitterClient:
                         cookies_map = None
                         logger.warning(f"Unrecognized cookie file format: {cookies_file}")
                     if cookies_map:
-                        from twikit_ext.client.client import Client
-                        self.client = Client(cookies_map)
+                        from twikit.client import Client
+                        self.client = Client(
+                            language='en-US',
+                            proxy=self.proxy.url if self.proxy else None,
+                            user_agent=self.config.twitter_user_agent
+                        )
+                        self.client.load_cookies(cookies_map)
                         await self.client.connect()
-                        user = await self.client.user()
+                        user = await self.client.get_me()
                         self.logged_in = True
                         logger.info(f"Login successful via cookie dict: {user}")
                         return True
@@ -228,10 +241,20 @@ class TwitterClient:
             if username and password:
                 logger.info("Attempting login via username/password (least stealthy, last resort)...")
                 try:
-                    from twikit_ext.client.client import Client
-                    self.client = Client()
-                    await self.client.login(username, password)
-                    user = await self.client.user()
+                    from twikit.client import Client
+                    self.client = Client(
+                        language='en-US',
+                        proxy=self.proxy.url if self.proxy else None,
+                        user_agent=self.config.twitter_user_agent
+                    )
+                    # Login with username, password, and potentially email/2FA
+                    await self.client.login(
+                        auth_info_1=username,
+                        auth_info_2=self.config.twitter_email, # twikit might require email for login
+                        password=password,
+                        totp_secret=self.config.twitter_2fa_secret # Pass 2FA secret if available
+                    )
+                    user = await self.client.get_me()
                     self.logged_in = True
                     logger.info(f"Login successful via username/password: {user}")
                     # Save cookies for future stealthier logins
@@ -239,8 +262,13 @@ class TwitterClient:
                     if cookies_file:
                         try:
                             os.makedirs(os.path.dirname(cookies_file), exist_ok=True)
+                            # twikit stores cookies in client.cookies (a CookieJar)
+                            # We need to convert it to a serializable dict.
+                            cookies_to_save = {}
+                            for cookie in self.client.cookies:
+                                cookies_to_save[cookie.name] = cookie.value
                             with open(cookies_file, 'w') as f:
-                                json.dump({n: v for n, v in self.client.http.cookies.items()}, f, indent=2)
+                                json.dump(cookies_to_save, f, indent=2)
                             logger.info(f"Saved session cookies to {cookies_file}")
                         except Exception as save_err:
                             logger.warning(f"Failed saving cookies: {save_err}")
@@ -265,14 +293,50 @@ class TwitterClient:
             logger.warning("Tweet exceeds max length. Truncating.")
             text = text[:self.config.max_tweet_length]
         # Rotate proxy before posting
-        await self.rotate_proxy_if_bad()
+        await self.rotate_proxy_if_bad() # Existing call
+
         try:
-            tweet = await self.client.create_tweet(text=text)
-            logger.info(f"Tweet posted: {tweet}")
-            return True
+            logger.debug(f"Attempting to post tweet (1st try): {text[:50]}...")
+            tweet = await self.client.create_tweet(text=text) 
+            logger.info(f"Tweet posted successfully (1st try): {getattr(tweet, 'id', 'N/A')}")
+            return tweet 
         except Exception as e:
-            logger.error(f"Failed to post tweet: {e}")
-            return False
+            is_auth_error = False
+            if hasattr(e, 'status_code') and e.status_code in [401, 403]:
+                is_auth_error = True
+                logger.warning(f"Potential auth error (status {e.status_code}) posting tweet. Attempting re-login. Error type: {type(e).__name__}, Error: {e}")
+            # Add other specific twikit auth error types here if known e.g.
+            # elif isinstance(e, twikit.errors.AuthError): # Hypothetical
+            #     is_auth_error = True
+            #     logger.warning(f"Specific AuthError posting tweet. Attempting re-login. Error: {e}")
+            else:
+                logger.error(f"Failed to post tweet (1st try) with non-auth error: {type(e).__name__}, {e}", exc_info=True)
+                # For non-auth errors, we might re-raise or return None depending on desired handling
+                return None # Or raise e
+
+            if is_auth_error:
+                logger.info("Attempting re-login due to auth error...")
+                try:
+                    login_successful = await self.login() 
+                    if login_successful:
+                        logger.info("Re-login successful. Retrying tweet post...")
+                        await self.rotate_proxy_if_bad() 
+                        tweet_retry = await self.client.create_tweet(text=text)
+                        logger.info(f"Tweet posted successfully (after re-login): {getattr(tweet_retry, 'id', 'N/A')}")
+                        return tweet_retry
+                    else:
+                        logger.error("Re-login failed. Could not post tweet.")
+                        return None 
+                except Exception as login_e:
+                    logger.error(f"Exception during re-login or tweet retry: {login_e}", exc_info=True)
+                    return None
+            else:
+                # This path should ideally not be reached if non-auth errors are handled above (e.g., by returning None or re-raising)
+                logger.error(f"Unhandled case after initial tweet post failure. Error was: {e}")
+                return None
+        # Fallback return, though logic above should cover returns.
+        return None
+
 
     async def post_tweet_with_media(self, text: str, media_path: str):
         """Post a tweet with media attachment (async)."""
@@ -285,14 +349,77 @@ class TwitterClient:
         # Rotate proxy before posting
         await self.rotate_proxy_if_bad()
         try:
-            media_id = await self.client.upload_media(media_path)
-            media_ids = [media_id]
-            tweet = await self.client.create_tweet(text=text, media_ids=media_ids)
-            logger.info(f"Media tweet posted: {tweet}")
+            # Assuming twikit.upload_media returns a media object or ID.
+            # If it returns an object, media_id might be media_obj.media_id_string or similar.
+            # For now, let's assume it returns the ID string directly.
+            media_id_str = await self.client.upload_media(media_path)
+            media_ids_list = [media_id_str]
+            tweet_obj = await self.client.create_tweet(text=text, media_ids=media_ids_list)
+            logger.info(f"Media tweet posted: {tweet_obj.id if tweet_obj else 'Unknown ID'}")
             return True
         except Exception as e:
             logger.error(f"Failed to post media tweet: {e}")
             return False
+
+    async def schedule_tweet_from_agent(self, text: str, media_path: str = None):
+        """Schedules a tweet from the agent with optional media."""
+        from datetime import datetime, timedelta, timezone # Import here
+        import random # Import here
+
+        if self.config.dry_run:
+            logger.info(f"[DRY RUN] Would schedule tweet: '{text}' with media '{media_path}'")
+            return
+
+        # Calculate scheduled_at_timestamp
+        now_utc = datetime.now(timezone.utc)
+        delay_seconds = random.randint(self.config.post_interval_min, self.config.post_interval_max)
+        scheduled_at_datetime = now_utc + timedelta(seconds=delay_seconds)
+
+        current_timestamp_utc = int(now_utc.timestamp())
+        scheduled_at_timestamp = int(scheduled_at_datetime.timestamp())
+
+        if scheduled_at_timestamp < current_timestamp_utc + MIN_SCHEDULE_BUFFER_SECONDS:
+            logger.warning(
+                f"Calculated schedule time {scheduled_at_datetime.isoformat()} is too soon. "
+                f"Adjusting to {MIN_SCHEDULE_BUFFER_SECONDS}s buffer."
+            )
+            scheduled_at_timestamp = current_timestamp_utc + MIN_SCHEDULE_BUFFER_SECONDS
+            scheduled_at_datetime = datetime.fromtimestamp(scheduled_at_timestamp, tz=timezone.utc)
+        
+        logger.info(f"Calculated schedule time: {scheduled_at_datetime.isoformat()} (Timestamp: {scheduled_at_timestamp})")
+
+        media_ids = None
+        if media_path and os.path.exists(media_path):
+            logger.info(f"Uploading media {media_path} for scheduled tweet...")
+            await self.rotate_proxy_if_bad()
+            try:
+                # Assuming twikit.upload_media returns a media ID string.
+                # The `wait_for_completion` parameter might not exist or be handled differently.
+                # If this method in twikit returns a Media object, we'd need media_obj.media_id_string
+                media_id_str = await self.client.upload_media(media_path) # Removed wait_for_completion
+                media_ids_list = [media_id_str]
+                logger.info(f"Media uploaded successfully: {media_id_str}")
+            except Exception as e:
+                logger.error(f"Failed to upload media {media_path}: {e}")
+                # Decide if you want to proceed without media or return
+                # For now, let's proceed without media if upload fails
+                media_ids_list = None # Use the renamed variable
+        
+        await self.rotate_proxy_if_bad()
+        try:
+            # Assuming twikit uses `schedule_tweet` and it returns a ScheduledTweet object or similar.
+            # The parameter `scheduled_at` is likely still an int timestamp.
+            scheduled_tweet_obj = await self.client.schedule_tweet(
+                scheduled_at_timestamp, # Positional argument if API expects it like that, or scheduled_at=
+                text,
+                media_ids=media_ids_list # Use the renamed variable
+            )
+            logger.info(
+                f"Successfully scheduled tweet ID: {scheduled_tweet_obj.id if scheduled_tweet_obj else 'Unknown ID'} with text '{text}' "
+                f"and media_ids '{media_ids}' at {scheduled_at_datetime.isoformat()}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to schedule tweet: {e}")
 
     async def quote_tweet(self, tweet_id: str, text: str, media_path: str = None):
         """Quote a tweet with optional media attachment (async)."""
@@ -302,12 +429,13 @@ class TwitterClient:
         # Rotate proxy before quoting
         await self.rotate_proxy_if_bad()
         try:
-            attachment_url = f"https://twitter.com/i/web/status/{tweet_id}"
-            media_ids = None
+            # attachment_url = f"https://twitter.com/i/web/status/{tweet_id}" # Old way
+            media_ids_list = None
             if media_path:
-                media_id = await self.client.upload_media(media_path)
-                media_ids = [media_id]
-            await self.client.create_tweet(text=text, media_ids=media_ids, attachment_url=attachment_url)
+                media_id_str = await self.client.upload_media(media_path)
+                media_ids_list = [media_id_str]
+            # Assuming twikit uses `quote_tweet_id` for quoting
+            await self.client.create_tweet(text=text, media_ids=media_ids_list, quote_tweet_id=tweet_id)
             logger.info(f"Quoted tweet {tweet_id} with text: {text} and media: {media_path}")
             return True
         except Exception as e:
@@ -322,7 +450,8 @@ class TwitterClient:
         # Rotate proxy before replying
         await self.rotate_proxy_if_bad()
         try:
-            await self.client.create_tweet(text=text, reply_to=tweet_id)
+            # Assuming twikit uses `reply_to_tweet_id` for replies
+            await self.client.create_tweet(text=text, reply_to_tweet_id=tweet_id)
             logger.info(f"Replied to tweet {tweet_id} with: {text}")
             return True
         except Exception as e:
@@ -337,7 +466,8 @@ class TwitterClient:
         # Rotate proxy before liking
         await self.rotate_proxy_if_bad()
         try:
-            await self.client.like_tweet(tweet_id)
+            # Assuming twikit uses `favorite_tweet` or `like`. Trying `favorite_tweet`.
+            await self.client.favorite_tweet(tweet_id)
             logger.info(f"Liked tweet {tweet_id}")
             return True
         except Exception as e:
@@ -352,6 +482,7 @@ class TwitterClient:
         # Rotate proxy before retweeting
         await self.rotate_proxy_if_bad()
         try:
+            # Assuming twikit uses `retweet`.
             await self.client.retweet(tweet_id)
             logger.info(f"Retweeted tweet {tweet_id}")
             return True
@@ -367,50 +498,98 @@ class TwitterClient:
         # Rotate proxy before search
         await self.rotate_proxy_if_bad()
         logger.info(f"Searching Twitter for: {query}")
-        # TODO: Implement actual search with twikit_ext
-        return []  # Placeholder
+        # Assuming twikit.search_tweet exists.
+        # The `product` parameter might change. Common alternatives: 'live', 'users', 'photos', 'videos'.
+        # For now, we'll assume 'Latest' is still valid or handled by default.
+        # twikit might return a list of Tweet objects.
+        search_results = await self.client.search_tweet(query, count=20) # Added a default count
+        # TODO: Adapt parsing of search_results if it's a list of Tweet objects
+        return search_results # Placeholder, needs adaptation based on actual return type
 
     async def poll(self):
         """Main poll loop (timeline, mentions, etc., async)."""
         logger.info(f"Polling Twitter. Interval: {self.config.poll_interval}s")
-        tweets = []
+        raw_tweets = [] # Changed variable name to indicate raw data
         if not self.config.search_enable:
             # Use timeline API, not search
             try:
-                logger.info("Fetching home timeline via API (search disabled)")
-                # Twikit_ext: use client.v11.onboarding_task or GQL if available
-                # This is a placeholder for the correct timeline fetch method
-                # Rotate proxy before fetching timeline/search
+                logger.info("Fetching home timeline via API (search disabled) - 1st attempt")
                 await self.rotate_proxy_if_bad()
-                result = await self.client.v11.onboarding_task(
-                    guest_token=None, token=None, subtask_inputs=None, data=None
-                )
-                # TODO: Parse tweets from result
-                tweets.extend(result.get('data', []) if isinstance(result, dict) else [])
+                home_timeline_tweets = await self.client.get_home_timeline(count=self.config.max_actions_processing)
+                if home_timeline_tweets: # Successfully fetched
+                    raw_tweets.extend(home_timeline_tweets)
+                    logger.debug(f"Successfully fetched {len(home_timeline_tweets)} tweets from home timeline (1st attempt).")
+                else: # No error, but no tweets
+                    logger.debug("Home timeline was empty (1st attempt).")
+
             except Exception as e:
-                logger.error(f"Failed to fetch home timeline: {e}")
-        else:
+                is_auth_error = False
+                if hasattr(e, 'status_code') and e.status_code in [401, 403]:
+                    is_auth_error = True
+                    logger.warning(f"Potential auth error (status {e.status_code}) fetching home timeline. Attempting re-login. Error: {type(e).__name__}, {e}")
+                else:
+                    logger.error(f"Failed to fetch home timeline (1st try) with non-auth error: {type(e).__name__}, {e}", exc_info=True)
+                    # For poll, we might not want to re-raise immediately, just return empty for this cycle.
+                
+                if is_auth_error:
+                    logger.info("Attempting re-login due to auth error during poll...")
+                    try:
+                        login_successful = await self.login()
+                        if login_successful:
+                            logger.info("Re-login successful. Retrying home timeline fetch...")
+                            await self.rotate_proxy_if_bad()
+                            home_timeline_tweets_retry = await self.client.get_home_timeline(count=self.config.max_actions_processing)
+                            if home_timeline_tweets_retry:
+                                raw_tweets.extend(home_timeline_tweets_retry)
+                                logger.debug(f"Successfully fetched {len(home_timeline_tweets_retry)} tweets from home timeline (after re-login).")
+                            else:
+                                logger.debug("Home timeline was empty (after re-login).")
+                        else:
+                            logger.error("Re-login failed. Could not fetch home timeline.")
+                    except Exception as login_e:
+                        logger.error(f"Exception during re-login or home timeline retry: {login_e}", exc_info=True)
+                # If it was a non-auth error or re-login failed, raw_tweets remains as it was (possibly empty)
+        else: # This is the `else` for `if not self.config.search_enable:`
             # Poll tweets from target users
-            for user in self.config.target_users:
+            for user_screen_name in self.config.target_users: # Renamed to be more specific
                 try:
-                    logger.info(f"Fetching tweets from {user}")
-                    # Rotate proxy before search
+                    logger.info(f"Fetching tweets from {user_screen_name}")
                     await self.rotate_proxy_if_bad()
-                    result = await self.client.search_tweet(query=f"from:{user}", product="Latest")
-                    tweets.extend(result if isinstance(result, list) else getattr(result, 'data', []))
+                    # Assuming search_tweet is adapted as above, or get_user_timeline exists
+                    # user_tweets = await self.client.search_tweet(query=f"from:{user_screen_name}", product="Latest", count=10)
+                    # Alternative: get tweets by user ID if screen_name is not directly supported in search
+                    user = await self.client.get_user_by_screen_name(user_screen_name)
+                    if user:
+                        user_tweets = await self.client.get_user_tweets(user.id, count=10, with_replies=False) # Example
+                        if user_tweets:
+                            raw_tweets.extend(user_tweets)
                 except Exception as e:
-                    logger.error(f"Failed to fetch tweets from {user}: {e}")
+                    logger.error(f"Failed to fetch tweets from {user_screen_name}: {e}")
             # Poll mentions
             try:
-                username = self.config.twitter_username
-                logger.info(f"Fetching mentions for @{username}")
-                # Rotate proxy before search
-                await self.rotate_proxy_if_bad()
-                result = await self.client.search_tweet(query=f"@{username}", product="Latest")
-                tweets.extend(result if isinstance(result, list) else getattr(result, 'data', []))
+                my_user_id = self.client.user_id # Assuming client object stores current user's ID after login
+                if my_user_id: # Check if user_id is available
+                    logger.info(f"Fetching mentions for user ID {my_user_id}")
+                    await self.rotate_proxy_if_bad()
+                    # Mentions timeline might be a specific method or a search query
+                    # mentions_tweets = await self.client.search_tweet(query=f"@{self.config.twitter_username}", product="Latest", count=10)
+                    mentions_tweets = await self.client.get_mentions(count=10) # Assuming a direct method
+                    if mentions_tweets:
+                        raw_tweets.extend(mentions_tweets)
+                else:
+                    logger.warning("Could not fetch mentions, user ID not available on client.")
             except Exception as e:
                 logger.error(f"Failed to fetch mentions: {e}")
-        return tweets
+        
+        # TODO: Convert raw_tweets (list of twikit.Tweet objects) to the dictionary format expected by XVioletAgent.
+        # This is a CRITICAL step for agent compatibility.
+        # For now, returning raw tweet objects which will likely break agent.py.
+        # Example conversion (needs to be implemented properly):
+        # processed_tweets = []
+        # for t in raw_tweets:
+        # processed_tweets.append({'id': t.id, 'text': t.text, 'user': {'screen_name': t.user.screen_name, ...}, ...})
+        # return processed_tweets
+        return raw_tweets # Placeholder - returning raw objects
 
     async def schedule_loop(self):
         """Periodically generate and schedule tweets using Twitter's API."""
@@ -474,14 +653,14 @@ class TwitterClient:
                         media_path = media_files[media_tweet_count]
                         logger.info(f"Scheduling media tweet {media_tweet_count + 1}/{total_media_to_schedule} using {os.path.basename(media_path)} for {datetime.fromtimestamp(target_timestamp, tz=timezone.utc).isoformat()}")
                         try:
-                            media_id = await self.client.upload_media(media_path, wait_for_completion=True)
+                            media_id_str = await self.client.upload_media(media_path) # Removed wait_for_completion
                             caption = await generate_media_caption(media_path) # LLM call
-                            tweet_id = await self.client.create_scheduled_tweet(
-                                scheduled_at=target_timestamp, # Use integer timestamp
-                                text=caption,
-                                media_ids=[media_id]
+                            scheduled_tweet_obj = await self.client.schedule_tweet(
+                                target_timestamp, # Use integer timestamp; or scheduled_at=
+                                caption,
+                                media_ids=[media_id_str]
                             )
-                            logger.info(f"Scheduled media tweet with ID: {tweet_id}, Media: {media_id}")
+                            logger.info(f"Scheduled media tweet with ID: {scheduled_tweet_obj.id if scheduled_tweet_obj else 'Unknown ID'}, Media: {media_id_str}")
                             media_tweet_count += 1
                             scheduled_count += 1
                         except Exception as e:
@@ -492,11 +671,11 @@ class TwitterClient:
                         logger.info(f"Scheduling text tweet for {datetime.fromtimestamp(target_timestamp, tz=timezone.utc).isoformat()}")
                         try:
                             tweet_text = await generate_tweet_text() # LLM call
-                            tweet_id = await self.client.create_scheduled_tweet(
-                                scheduled_at=target_timestamp, # Use integer timestamp
-                                text=tweet_text
+                            scheduled_tweet_obj = await self.client.schedule_tweet(
+                                target_timestamp, # Use integer timestamp; or scheduled_at=
+                                tweet_text
                             )
-                            logger.info(f"Scheduled text tweet with ID: {tweet_id}")
+                            logger.info(f"Scheduled text tweet with ID: {scheduled_tweet_obj.id if scheduled_tweet_obj else 'Unknown ID'}")
                             scheduled_count += 1
                         except Exception as e:
                             logger.error(f"Failed to schedule text tweet: {e}")
@@ -516,10 +695,8 @@ class TwitterClient:
 
     async def run(self):
         await self.login()
-        await asyncio.gather(
-            self._poll_loop(),
-            self.schedule_loop()
-        )
+        # self.schedule_loop() # Disabled as Agent now handles scheduling initiation
+        await self._poll_loop()
 
     async def _poll_loop(self):
         while True:

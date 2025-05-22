@@ -2,8 +2,9 @@ pytest
 pytest-asyncio
 pillow
 python-dotenv
+litellm
+llama-cpp-python
 twikit
-twikit_ext
 proxystr
 ruff
 httpx
@@ -12,4 +13,3 @@ pytest
 colorlog
 sqlite-vec
 sqlite-rembed
-
