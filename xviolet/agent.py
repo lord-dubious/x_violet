@@ -133,35 +133,70 @@ class XVioletAgent:
                 # 3. Ask LLM to select action and generate text (if needed)
                 llm_result = self.llm.generate_structured_output(prompt)
                 action = llm_result.get("action")
-                generated_text = llm_result.get("text") # Initial reply/action text
+                initial_generated_text = llm_result.get("text") # Renamed for clarity
+                final_generated_text_for_dispatch = initial_generated_text # Start with the initial version
 
-                # Contextual Search for Replies
-                if action == "reply" and generated_text and self.vector_store_manager:
-                    original_tweet_text = processed_tweet_data.get('text')
-                    if original_tweet_text:
-                        try:
-                            logger.info(f"Reply action: Searching vector store for context related to: '{original_tweet_text[:100]}...'")
-                            # VectorStoreFallbackManager.search expects query_embedding.
-                            # If it's text, it handles it for LocalVectorStore.
-                            context_docs = await self.vector_store_manager.search(query_embedding=original_tweet_text, top_k=3)
-                            if context_docs:
-                                logger.info(f"Retrieved {len(context_docs)} context documents for reply:")
-                                for doc in context_docs:
-                                    logger.info(f"  - ID: {doc.get('id')}, Score: {doc.get('score')}, Text: {doc.get('text', '')[:100]}...")
-                                # Store context_docs, e.g., self.current_reply_context = context_docs
-                                # For now, just logging. This context would be used in a subsequent step
-                                # to refine `generated_text` before dispatching.
-                            else:
-                                logger.info("No context documents found for this reply.")
-                        except Exception as e_vs_search_reply:
-                            logger.error(f"Error searching vector store for reply context: {e_vs_search_reply}", exc_info=True)
-                
+                # Contextual Search and Refinement for Replies
+                if action == "reply" and initial_generated_text: # Check initial_generated_text before proceeding
+                    reply_context_documents = []
+                    if self.vector_store_manager:
+                        original_tweet_text_for_context = processed_tweet_data.get('text')
+                        if original_tweet_text_for_context:
+                            try:
+                                logger.info(f"Reply action: Searching VS for context related to: '{original_tweet_text_for_context[:100]}...'")
+                                reply_context_documents = await self.vector_store_manager.search(
+                                    query_embedding=original_tweet_text_for_context, # Manager handles text query for local store
+                                    top_k=3
+                                )
+                                if reply_context_documents:
+                                    logger.info(f"Retrieved {len(reply_context_documents)} context documents for reply:")
+                                    for doc_idx, doc_vs in enumerate(reply_context_documents):
+                                        logger.info(f"  CtxDoc-{doc_idx+1}: ID {doc_vs.get('id')}, Score {doc_vs.get('score')}, Text: {doc_vs.get('text', '')[:70]}...")
+                                else:
+                                    logger.info("No context documents found from VS for this reply.")
+                            except Exception as e_vs_search_reply:
+                                logger.error(f"Error searching vector store for reply context: {e_vs_search_reply}", exc_info=True)
+                    
+                    if reply_context_documents and self.llm and self.llm.is_enabled: # Check if llm is available
+                        context_snippets = [doc.get('text', '') for doc in reply_context_documents if doc.get('text', '').strip()]
+                        if context_snippets:
+                            formatted_reply_context = "Contextual Information:\n" + "\n---\n".join(context_snippets)
+                            
+                            persona_name_for_prompt = (self.persona.name if self.persona and hasattr(self.persona, 'name') 
+                                                       else 'an AI assistant')
+                            
+                            refinement_prompt = (
+                                f"You are {persona_name_for_prompt}. Your task is to refine a draft Twitter reply based on the provided context and your persona.\n\n"
+                                f"Context from related tweets/documents:\n{formatted_reply_context}\n\n"
+                                f"Draft Reply to improve: \"{initial_generated_text}\"\n\n"
+                                f"Instructions: Review the draft reply and the context. If the context provides relevant information "
+                                f"or a better angle, refine the draft reply to be more contextual, engaging, and aligned with your persona. "
+                                f"If the context is not helpful or the draft is already good, you can choose to keep the draft as is or make minimal changes. "
+                                f"Output only the refined reply text, without any preamble."
+                            )
+                            logger.debug(f"Attempting to refine reply using context. Refinement prompt: {refinement_prompt[:300]}...")
+                            try:
+                                # self.llm is an instance of LLMFallbackManager
+                                refined_text = await self.llm.generate_text(prompt=refinement_prompt, context_type="reply_refinement")
+                                if refined_text and refined_text.strip() and refined_text.strip() != initial_generated_text:
+                                    logger.info(f"Original reply draft: '{initial_generated_text}'. Refined reply: '{refined_text.strip()}'")
+                                    final_generated_text_for_dispatch = refined_text.strip()
+                                elif refined_text and refined_text.strip() == initial_generated_text:
+                                    logger.info("Reply refinement resulted in the same text as original draft. Using original.")
+                                else: # refined_text is None or empty
+                                    logger.info("Reply refinement did not produce new text or was empty, using original draft.")
+                            except Exception as e_refine:
+                                logger.error(f"Error during reply refinement LLM call: {e_refine}. Using original draft.", exc_info=True)
+                        else:
+                            logger.info("No usable text snippets from context documents for reply refinement.")
+                    elif not (self.llm and self.llm.is_enabled):
+                        logger.warning("LLM manager not available or not enabled, skipping reply refinement.")
+
                 # 4. Dispatch action (quote, reply, like, retweet)
-                # Note: generated_text might be refined in a future step using context_docs before this dispatch.
                 self.actions.dispatch(
                     action=action,
                     tweet_id=processed_tweet_data['id'], 
-                    text=generated_text,
+                    text=final_generated_text_for_dispatch, # Use the potentially refined text
                     media_path=processed_tweet_data['media_path'], 
                     conversation=processed_tweet_data['conversation'] 
                 )
@@ -257,17 +292,29 @@ class XVioletAgent:
                 scheduled_in_cycle_count = 0
                 media_scheduled_in_cycle_count = 0
                 
-                # Reload used media set at the start of each cycle to pick up external changes if any
-                # self.used_media_set = load_used_media() # Optional: consider if needed per cycle
+                # query_text_for_new_tweet is defined above this block and holds the topic used for VS search
 
-                for _ in range(self.config.max_scheduled_tweets_total):
+                for _ in range(self.config.max_scheduled_tweets_total): # Iterate up to total allowed, not from scheduled_in_cycle_count
                     if scheduled_in_cycle_count >= self.config.max_scheduled_tweets_total:
-                        logger.info("Reached max_scheduled_tweets_total for this cycle.")
+                        logger.info(f"Reached max_scheduled_tweets_total ({self.config.max_scheduled_tweets_total}) for this cycle.")
                         break
 
                     selected_media_path = None
-                    text_content = None
+                    text_content = None # Reset for each potential tweet
                     is_media_attempt = False
+
+                    # Prepare context string from docs retrieved earlier
+                    formatted_context = ""
+                    if hasattr(self, 'current_new_tweet_context_docs') and self.current_new_tweet_context_docs:
+                        context_snippets = [doc.get('text', '') for doc in self.current_new_tweet_context_docs if doc.get('text', '').strip()]
+                        if context_snippets:
+                            formatted_context = "Contextual Information:\n" + "\n---\n".join(context_snippets) + "\n\n"
+                            logger.debug(f"Using formatted context for LLM prompt: {formatted_context[:200]}...")
+                        else:
+                            logger.debug("current_new_tweet_context_docs was present but yielded no usable snippets.")
+                    else:
+                        logger.debug("No current_new_tweet_context_docs to use for LLM prompt.")
+
 
                     # Determine if a media tweet should be generated
                     if media_scheduled_in_cycle_count < self.config.max_scheduled_media_tweets and \
@@ -290,37 +337,47 @@ class XVioletAgent:
                                 selected_media_path = str(random.choice(unused_media_files))
                                 logger.info(f"Selected unused media: {selected_media_path}")
                                 try:
-                                    # Analyze image (ensure personality is used via context_type="post")
-                                    text_content = self.llm.analyze_image(selected_media_path, context_type="post")
+                                    base_caption_prompt = "Analyze the following image and generate a tweet caption for it, reflecting your persona."
+                                    prompt_for_image_analysis = f"{formatted_context}Based on the context above (if any) and your persona, analyze the image and generate a suitable tweet caption:" if formatted_context else base_caption_prompt
+                                    
+                                    text_content = self.loop.run_until_complete(
+                                        self.llm.analyze_image(
+                                            selected_media_path, 
+                                            context_type="post", # context_type for persona handling in provider
+                                            prompt_override=prompt_for_image_analysis
+                                        )
+                                    )
                                     if not text_content:
-                                        logger.error(f"LLM failed to generate content for media {selected_media_path}. Skipping this media tweet slot.")
-                                        # text_content remains None, selected_media_path is still set
-                                        # This iteration will be skipped by the `if text_content:` block later
+                                        logger.error(f"LLM failed to generate caption for media {selected_media_path}. Skipping this media tweet slot.")
                                 except Exception as e:
-                                    logger.error(f"Error during LLM analysis for media {selected_media_path}: {e}. Skipping this media tweet slot.")
-                                    text_content = None # Ensure text_content is None on LLM error
-                                    # selected_media_path is still set
+                                    logger.error(f"Error during LLM caption generation for media {selected_media_path}: {e}. Skipping this media tweet slot.", exc_info=True)
+                                    text_content = None 
                             else:
-                                logger.info("No unused image media found. Will attempt text tweet if possible.")
-                                is_media_attempt = False # Cannot make a media tweet, selected_media_path remains None
+                                logger.info("No unused image media found for a media tweet attempt.")
+                                is_media_attempt = False 
                         else:
                             logger.warning(f"Media directory {self.config.media_dir} not found or not a directory. Skipping media tweet attempt.")
-                            is_media_attempt = False # Cannot make a media tweet, selected_media_path remains None
+                            is_media_attempt = False
                     
-                    # Generate text-only tweet if it was decided from the start (not a media attempt)
-                    if not is_media_attempt: # Only enter if it was never a media attempt or media selection failed (no path)
-                        logger.info("Attempting to schedule a text-only tweet (not as a fallback for failed media analysis).")
+                    # Generate text-only tweet if not a media attempt OR if media attempt failed to secure a path
+                    if not is_media_attempt: 
+                        logger.info("Attempting to schedule a text-only tweet.")
+                        base_topic_for_llm = query_text_for_new_tweet # Use the topic from VS search
+                        prompt_for_text_generation = f"Based on your persona, generate a tweet about: {base_topic_for_llm}."
+                        if formatted_context:
+                            prompt_for_text_generation = f"{formatted_context}Based on the context above (if any) and your persona, generate a tweet about: {base_topic_for_llm}."
+                        
                         try:
-                            # Generate text (ensure personality is used via context_type="post")
-                            text_content = self.llm.generate_text("Automated tweet from x_violet", context_type="post")
+                            text_content = self.loop.run_until_complete(
+                                self.llm.generate_text(prompt=prompt_for_text_generation, context_type="post")
+                            )
                             if not text_content:
-                                logger.warning("Text generation failed for text-only tweet. Skipping this slot.")
-                                # continue # Skip this iteration of the loop - text_content will be None, so it skips scheduling
+                                logger.warning(f"Text generation failed for topic: {base_topic_for_llm}. Skipping this slot.")
                         except Exception as e:
-                            logger.error(f"Error during text generation for text-only tweet: {e}")
-                            text_content = None # Ensure text_content is None on error
+                            logger.error(f"Error during text generation for topic '{base_topic_for_llm}': {e}", exc_info=True)
+                            text_content = None 
 
-                    # Schedule the tweet if text_content was successfully generated (either for media or text-only)
+                    # Schedule the tweet if text_content was successfully generated
                     if text_content: # This condition now correctly skips if media analysis failed
                         try:
                             # If it was a media attempt but text_content is None (due to LLM failure for media),

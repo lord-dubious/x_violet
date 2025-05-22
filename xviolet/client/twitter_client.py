@@ -293,16 +293,50 @@ class TwitterClient:
             logger.warning("Tweet exceeds max length. Truncating.")
             text = text[:self.config.max_tweet_length]
         # Rotate proxy before posting
-        await self.rotate_proxy_if_bad()
+        await self.rotate_proxy_if_bad() # Existing call
+
         try:
-            # Assuming twikit.create_tweet returns a Tweet object.
-            # Logging the ID of the tweet object might be tweet.id
-            tweet_obj = await self.client.create_tweet(text=text)
-            logger.info(f"Tweet posted: {tweet_obj.id if tweet_obj else 'Unknown ID'}")
-            return True
+            logger.debug(f"Attempting to post tweet (1st try): {text[:50]}...")
+            tweet = await self.client.create_tweet(text=text) 
+            logger.info(f"Tweet posted successfully (1st try): {getattr(tweet, 'id', 'N/A')}")
+            return tweet 
         except Exception as e:
-            logger.error(f"Failed to post tweet: {e}")
-            return False
+            is_auth_error = False
+            if hasattr(e, 'status_code') and e.status_code in [401, 403]:
+                is_auth_error = True
+                logger.warning(f"Potential auth error (status {e.status_code}) posting tweet. Attempting re-login. Error type: {type(e).__name__}, Error: {e}")
+            # Add other specific twikit auth error types here if known e.g.
+            # elif isinstance(e, twikit.errors.AuthError): # Hypothetical
+            #     is_auth_error = True
+            #     logger.warning(f"Specific AuthError posting tweet. Attempting re-login. Error: {e}")
+            else:
+                logger.error(f"Failed to post tweet (1st try) with non-auth error: {type(e).__name__}, {e}", exc_info=True)
+                # For non-auth errors, we might re-raise or return None depending on desired handling
+                return None # Or raise e
+
+            if is_auth_error:
+                logger.info("Attempting re-login due to auth error...")
+                try:
+                    login_successful = await self.login() 
+                    if login_successful:
+                        logger.info("Re-login successful. Retrying tweet post...")
+                        await self.rotate_proxy_if_bad() 
+                        tweet_retry = await self.client.create_tweet(text=text)
+                        logger.info(f"Tweet posted successfully (after re-login): {getattr(tweet_retry, 'id', 'N/A')}")
+                        return tweet_retry
+                    else:
+                        logger.error("Re-login failed. Could not post tweet.")
+                        return None 
+                except Exception as login_e:
+                    logger.error(f"Exception during re-login or tweet retry: {login_e}", exc_info=True)
+                    return None
+            else:
+                # This path should ideally not be reached if non-auth errors are handled above (e.g., by returning None or re-raising)
+                logger.error(f"Unhandled case after initial tweet post failure. Error was: {e}")
+                return None
+        # Fallback return, though logic above should cover returns.
+        return None
+
 
     async def post_tweet_with_media(self, text: str, media_path: str):
         """Post a tweet with media attachment (async)."""
@@ -479,16 +513,43 @@ class TwitterClient:
         if not self.config.search_enable:
             # Use timeline API, not search
             try:
-                logger.info("Fetching home timeline via API (search disabled)")
+                logger.info("Fetching home timeline via API (search disabled) - 1st attempt")
                 await self.rotate_proxy_if_bad()
-                # Assuming twikit has a method like `get_home_timeline`.
-                # It likely returns a list of Tweet objects.
-                home_timeline_tweets = await self.client.get_home_timeline(count=self.config.max_actions_processing) # Added count
-                if home_timeline_tweets:
+                home_timeline_tweets = await self.client.get_home_timeline(count=self.config.max_actions_processing)
+                if home_timeline_tweets: # Successfully fetched
                     raw_tweets.extend(home_timeline_tweets)
+                    logger.debug(f"Successfully fetched {len(home_timeline_tweets)} tweets from home timeline (1st attempt).")
+                else: # No error, but no tweets
+                    logger.debug("Home timeline was empty (1st attempt).")
+
             except Exception as e:
-                logger.error(f"Failed to fetch home timeline: {e}")
-        else:
+                is_auth_error = False
+                if hasattr(e, 'status_code') and e.status_code in [401, 403]:
+                    is_auth_error = True
+                    logger.warning(f"Potential auth error (status {e.status_code}) fetching home timeline. Attempting re-login. Error: {type(e).__name__}, {e}")
+                else:
+                    logger.error(f"Failed to fetch home timeline (1st try) with non-auth error: {type(e).__name__}, {e}", exc_info=True)
+                    # For poll, we might not want to re-raise immediately, just return empty for this cycle.
+                
+                if is_auth_error:
+                    logger.info("Attempting re-login due to auth error during poll...")
+                    try:
+                        login_successful = await self.login()
+                        if login_successful:
+                            logger.info("Re-login successful. Retrying home timeline fetch...")
+                            await self.rotate_proxy_if_bad()
+                            home_timeline_tweets_retry = await self.client.get_home_timeline(count=self.config.max_actions_processing)
+                            if home_timeline_tweets_retry:
+                                raw_tweets.extend(home_timeline_tweets_retry)
+                                logger.debug(f"Successfully fetched {len(home_timeline_tweets_retry)} tweets from home timeline (after re-login).")
+                            else:
+                                logger.debug("Home timeline was empty (after re-login).")
+                        else:
+                            logger.error("Re-login failed. Could not fetch home timeline.")
+                    except Exception as login_e:
+                        logger.error(f"Exception during re-login or home timeline retry: {login_e}", exc_info=True)
+                # If it was a non-auth error or re-login failed, raw_tweets remains as it was (possibly empty)
+        else: # This is the `else` for `if not self.config.search_enable:`
             # Poll tweets from target users
             for user_screen_name in self.config.target_users: # Renamed to be more specific
                 try:
