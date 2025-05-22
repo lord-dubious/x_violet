@@ -246,5 +246,41 @@ class AgentConfig:
     def __repr__(self):
         return f"<AgentConfig persona={self.character_file} twitter={self.twitter_username} dry_run={self.dry_run}>"
 
+    def update_scheduling_params_from_cli(self, cli_params: Dict[str, Any]):
+        logger.info(f"Updating scheduling parameters from CLI input: {cli_params}")
+        
+        interval_unit = cli_params.get('interval_unit', 'hours')
+        interval_value = cli_params.get('interval_value', 6) # Default to 6 if not provided
+        
+        multiplier_to_minutes = 1 # Base is minutes
+        if interval_unit == 'hours':
+            multiplier_to_minutes = 60
+        elif interval_unit == 'days':
+            multiplier_to_minutes = 60 * 24
+            
+        # Calculate interval in seconds
+        interval_in_seconds = interval_value * multiplier_to_minutes * 60
+        
+        # For this version, min and max post intervals are set to the same value from CLI
+        self.post_interval_min = interval_in_seconds
+        self.post_interval_max = interval_in_seconds 
+        
+        # Update tweet count limits
+        self.max_scheduled_tweets_total = cli_params.get('total_tweets', 5) # Default to 5
+        self.max_scheduled_media_tweets = cli_params.get('media_tweets', 2) # Default to 2
+        
+        # Ensure media tweets doesn't exceed total (should be caught by CLI input validation, but double check)
+        if self.max_scheduled_media_tweets > self.max_scheduled_tweets_total:
+            logger.warning(f"CLI input for media tweets ({self.max_scheduled_media_tweets}) "
+                           f"exceeds total tweets ({self.max_scheduled_tweets_total}). "
+                           f"Adjusting media tweets to {self.max_scheduled_tweets_total}.")
+            self.max_scheduled_media_tweets = self.max_scheduled_tweets_total
+
+        logger.info("Effective scheduling parameters updated by CLI:")
+        logger.info(f"  Post Interval Min (seconds): {self.post_interval_min}")
+        logger.info(f"  Post Interval Max (seconds): {self.post_interval_max}")
+        logger.info(f"  Max Scheduled Tweets Total per cycle: {self.max_scheduled_tweets_total}")
+        logger.info(f"  Max Scheduled Media Tweets per cycle: {self.max_scheduled_media_tweets}")
+
 # Singleton instance for all modules to import
 config = AgentConfig()

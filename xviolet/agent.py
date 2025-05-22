@@ -8,14 +8,15 @@ import asyncio
 import time
 import random
 from pathlib import Path
-import os
-from typing import Optional
+import os # Added os import
 from xviolet.config import config
+from xviolet.provider.llm import LLMManager
 from xviolet.actions import ActionManager
 from xviolet.client.twitter_client import TwitterClient
 from xviolet.media_tracker import load_used_media, mark_media_as_used, is_media_used
 from xviolet.vector.fallback_manager import VectorStoreFallbackManager
-from xviolet.persona import Persona # ADDED Persona import
+from xviolet.persona import Persona
+from xviolet.scheduler import Scheduler # ADDED Scheduler import
 
 logger = logging.getLogger("xviolet.agent")
 
@@ -26,7 +27,7 @@ class XVioletAgent:
         self.twitter = TwitterClient()
         self.actions = ActionManager(self.twitter)
         self.used_media_set = load_used_media()
-        self.current_new_tweet_context_docs = [] # Initialize context attribute
+        # self.current_new_tweet_context_docs = [] # REMOVED as per cleanup task
 
         # Load Persona
         self.persona: Optional[Persona] = None
@@ -39,224 +40,83 @@ class XVioletAgent:
         else:
             logger.warning(f"Persona file not configured or not found: {self.config.character_file}. Proceeding without persona.")
 
-        # Initialize LLMFallbackManager with provider configurations
-        from xviolet.llm.fallback_manager import LLMFallbackManager
+        # Initialize LLMManager (now LLMFallbackManager)
+        # This was deferred from the original plan, but it's better to have it here.
+        # The agent's LLMManager should use the LLM provider configs from AgentConfig.
+        from xviolet.llm.fallback_manager import LLMFallbackManager as LLMManager_Fallback # Alias to avoid name clash
         try:
             logger.info("Initializing LLMFallbackManager...")
             # AgentConfig stores the list of dicts in self.config.llm_provider_configs
-            self.llm = LLMFallbackManager(llm_provider_configs=self.config.llm_provider_configs)
+            self.llm = LLMManager_Fallback(llm_provider_configs=self.config.llm_provider_configs)
             logger.info("LLMFallbackManager initialized successfully.")
-            if not self.llm.providers:  # Check if any providers were actually loaded
+            if not self.llm.is_enabled: # Check if any providers were actually loaded
                  logger.warning("LLMFallbackManager has no enabled providers. LLM functionality will be offline.")
         except Exception as e:
             logger.error(f"Failed to initialize LLMFallbackManager: {e}", exc_info=True)
-            self.llm = None  # Set to None if initialization fails
+            self.llm = None # Set to None if initialization fails
 
         try:
             logger.info("Initializing VectorStoreFallbackManager...")
-            # Ensure vector_store_configs is a list of configurations
-            if not hasattr(self.config, 'vector_store_configs') or not self.config.vector_store_configs:
-                logger.warning("No vector store configurations found in config. Using default local store.")
-                self.config.vector_store_configs = [
-                    {
-                        'type': 'local',
-                        'name': 'default_local_store',
-                        'config': {'db_path': 'data/vector_store.db'}
-                    }
-                ]
-            
-            # Make sure we're passing a list of configurations
-            if isinstance(self.config.vector_store_configs, dict):
-                # If it's a single config dict, wrap it in a list
-                store_configs = [self.config.vector_store_configs]
-            elif isinstance(self.config.vector_store_configs, list):
-                store_configs = self.config.vector_store_configs
-            else:
-                raise ValueError("vector_store_configs must be a dict or list of dicts")
-            
-            # Initialize with the list of store configurations
-            self.vector_store_manager = VectorStoreFallbackManager(store_configs)
-            logger.info("VectorStoreFallbackManager initialized successfully with %d store(s).", 
-                       len(store_configs))
+            manager_init_config = {'store_configs_list': self.config.vector_store_configs}
+            self.vector_store_manager = VectorStoreFallbackManager(manager_init_config)
+            logger.info("VectorStoreFallbackManager initialized successfully.")
         except Exception as e: 
             logger.error(f"Failed to initialize VectorStoreFallbackManager: {e}", exc_info=True)
             self.vector_store_manager = None
+        
+        # Initialize Scheduler
+        try:
+            logger.info("Initializing Scheduler...")
+            self.scheduler = Scheduler(
+                config=self.config,
+                llm_manager=self.llm, # LLMFallbackManager instance
+                vector_store_manager=self.vector_store_manager,
+                twitter_client=self.twitter,
+                persona=self.persona,
+                used_media_set=self.used_media_set, # Pass the live set
+                mark_media_as_used_func=mark_media_as_used # Pass the function
+            )
+            logger.info("Scheduler initialized successfully.")
+        except Exception as e:
+            logger.error(f"Failed to initialize Scheduler: {e}", exc_info=True)
+            self.scheduler = None
 
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
 
-    def _build_action_prompt(self, tweet: str, user: dict, available_actions: list, context: dict = None) -> str:
-        """
-        Build a prompt for the LLM to decide on an action and generate a response.
-        
-        Args:
-            tweet: The tweet text to respond to
-            user: User information dictionary
-            available_actions: List of available actions
-            context: Additional context about the tweet
-            
-        Returns:
-            str: Formatted prompt for the LLM
-        """
-        # Build the prompt using persona if available
-        persona_context = ""
-        if self.persona:
-            persona_context = f"""
-            You are {self.persona.name}, {self.persona.description}
-            Your personality: {self.persona.personality}
-            Your goals: {self.persona.goals}
-            Your constraints: {self.persona.constraints}
-            """
-            
-        # Build the available actions list
-        actions_list = "\n".join([f"- {action}" for action in available_actions])
-        
-        prompt = f"""
-        {persona_context}
-        
-        You are an AI assistant analyzing a tweet and deciding how to respond.
-        
-        TWEET FROM @{user.get('screen_name', 'unknown')}:
-        {tweet}
-        
-        AVAILABLE ACTIONS:
-        {actions_list}
-        
-        Respond with a JSON object containing:
-        1. "action": The action to take (must be one of the available actions)
-        2. "text": The text to post (if applicable for the action)
-        
-        Example response:
-        {{
-            "action": "reply",
-            "text": "Your response here"
-        }}
-        
-        RESPONSE (JSON only, no other text):
-        """
-        
-        return prompt.strip()
-        
-    def _parse_llm_response(self, response_text: str) -> tuple:
-        """
-        Parse the LLM response to extract action and text.
-        
-        Args:
-            response_text: Raw response text from the LLM
-            
-        Returns:
-            tuple: (action, text) where action is the selected action and text is the generated text
-        """
-        import json
-        import re
-        
-        # Default values
-        action = None
-        text = ""
-        
-        if not response_text:
-            logger.warning("Empty response from LLM")
-            return action, text
-            
-        try:
-            # Try to find JSON in the response
-            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group(0))
-                action = result.get("action")
-                text = result.get("text", "")
-            else:
-                # If no JSON, try to extract action from the text
-                action_match = re.search(r'"action"\s*:\s*"([^"]+)"', response_text)
-                text_match = re.search(r'"text"\s*:\s*"([^"]+)"', response_text)
-                
-                if action_match:
-                    action = action_match.group(1)
-                if text_match:
-                    text = text_match.group(1)
-                    
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse LLM response as JSON: {e}")
-            # Fallback: try to extract action and text with more permissive parsing
-            action_match = re.search(r'action[\'\"]?\s*[:=]\s*[\'\"]([^\'\"]+)', response_text, re.IGNORECASE)
-            text_match = re.search(r'text[\'\"]?\s*[:=]\s*[\'\"]([^\'\"]+)', response_text, re.IGNORECASE | re.DOTALL)
-            
-            if action_match:
-                action = action_match.group(1).strip()
-            if text_match:
-                text = text_match.group(1).strip()
-        
-        return action, text
-        
     async def run_once(self):
         # 1. Fetch timeline/tweets to consider
         # Authenticate before polling - login() is async, so await it
-        await self.twitter.login()
-        timeline = await self.twitter.poll()
-        
+        await self.twitter.login() # MODIFIED: Direct await
+        timeline = await self.twitter.poll() # MODIFIED: Direct await
         # Limit number of tweets processed per cycle
         limit = self.config.max_actions_processing
         timeline = timeline[:limit]
-        
         if not timeline:
             logger.info("No tweets to process.")
             return
-            
-        for tweet_obj in timeline:  # tweet_obj is a twikit.Tweet object
+        for tweet_obj in timeline: # tweet_obj is now a twikit.Tweet object
             try:
-                # Convert twikit.Tweet to the expected dictionary format
-                user_obj = getattr(tweet_obj, 'user', None) or getattr(tweet_obj, 'author', None)
+                user_obj = getattr(tweet_obj, 'author', None)
                 if not user_obj:
-                    logger.warning(f"Tweet object {getattr(tweet_obj, 'id', 'Unknown ID')} missing user/author. Skipping.")
+                    logger.warning(f"Tweet object {getattr(tweet_obj, 'id', 'Unknown ID')} missing author. Skipping.")
                     continue
 
-                # Extract tweet data
-                tweet_data = {
-                    'id': str(getattr(tweet_obj, 'id', '')),
-                    'id_str': str(getattr(tweet_obj, 'id', '')),  # For compatibility
-                    'text': getattr(tweet_obj, 'text', '') or getattr(tweet_obj, 'full_text', ''),
-                    'created_at': getattr(tweet_obj, 'created_at', ''),
-                    'user': {
-                        'id': str(getattr(user_obj, 'id', '')),
-                        'id_str': str(getattr(user_obj, 'id', '')),  # For compatibility
-                        'screen_name': getattr(user_obj, 'screen_name', '') or getattr(user_obj, 'username', 'unknown_user'),
-                        'name': getattr(user_obj, 'name', 'Unknown User'),
-                        'profile_image_url_https': getattr(user_obj, 'profile_image_url_https', '')
-                    },
-                    'in_reply_to_status_id': getattr(tweet_obj, 'in_reply_to_status_id', None),
-                    'in_reply_to_user_id': getattr(tweet_obj, 'in_reply_to_user_id', None),
-                    'in_reply_to_screen_name': getattr(tweet_obj, 'in_reply_to_screen_name', ''),
-                    'is_quote_status': getattr(tweet_obj, 'is_quote_status', False),
-                    'retweet_count': getattr(tweet_obj, 'retweet_count', 0),
-                    'favorite_count': getattr(tweet_obj, 'favorite_count', 0),
-                    'favorited': getattr(tweet_obj, 'favorited', False),
-                    'retweeted': getattr(tweet_obj, 'retweeted', False),
-                    'lang': getattr(tweet_obj, 'lang', 'en')
-                }
+                # Reconstruct tweet dictionary for compatibility
+                tweet_id_str = str(getattr(tweet_obj, 'id', None))
+                tweet_text = getattr(tweet_obj, 'text', None)
                 
-                # Handle media if available
-                media_entities = getattr(tweet_obj, 'media', None) or getattr(tweet_obj, 'extended_entities', {}).get('media', [])
-                if media_entities:
-                    tweet_data['extended_entities'] = {'media': []}
-                    for media in media_entities:
-                        media_info = {
-                            'id': str(getattr(media, 'id', '')),
-                            'type': getattr(media, 'type', 'photo'),
-                            'media_url_https': getattr(media, 'media_url_https', '')
-                        }
-                        tweet_data['extended_entities']['media'].append(media_info)
+                user_screen_name = getattr(user_obj, 'screen_name', None)
+                if not user_screen_name: # Fallback to username if screen_name is not available
+                    user_screen_name = getattr(user_obj, 'username', 'unknown_user')
                 
-                # For compatibility with existing code
-                tweet_id_str = tweet_data['id_str']
-                tweet_text = tweet_data['text']
-                user_screen_name = tweet_data['user']['screen_name']
-                user_display_name = tweet_data['user']['name']
-                media_path = None  # Will be set later if media is downloaded
+                user_display_name = getattr(user_obj, 'name', 'Unknown User')
+
+                # media_path is not provided by poll() in its current form
+                media_path = None 
                 
-                # Log the processed tweet for debugging
-                logger.debug(f"Processed tweet {tweet_id_str} from @{user_screen_name}")
-                
-                # Determine conversation status based on reply information
+                # Determine conversation status
+                # Assuming 'replied_to' or 'in_reply_to_status_id' or similar attribute indicates a reply
                 # twikit.Tweet objects often have `in_reply_to_tweet_id` or similar
                 conversation_flag = bool(getattr(tweet_obj, 'in_reply_to_tweet_id', None))
 
@@ -281,22 +141,18 @@ class XVioletAgent:
                 logger.debug(f"Processing tweet: ID {processed_tweet_data['id']}, Text: {processed_tweet_data['text']}")
 
                 # 2. Build LLM prompt (persona, tweet, context, available actions)
-                prompt = self._build_action_prompt(
+                prompt = self.llm.build_action_prompt(
+                    persona_path=self.config.character_file,
                     tweet=processed_tweet_data['text'],
-                    user=processed_tweet_data['user'],
+                    user=processed_tweet_data['user'], # Pass the reconstructed user dictionary
                     available_actions=self.actions.SUPPORTED_ACTIONS,
-                    context=processed_tweet_data
+                    context=processed_tweet_data # Pass the full reconstructed dict as context
                 )
-                
-                # 3. Generate response using the new LLM interface
-                llm_response = await self.llm.generate_text(
-                    prompt=prompt,
-                    context_type="action_selection"
-                )
-                
-                # Parse the LLM response to extract action and text
-                action, initial_generated_text = self._parse_llm_response(llm_response)
-                final_generated_text_for_dispatch = initial_generated_text  # Start with the initial version
+                # 3. Ask LLM to select action and generate text (if needed)
+                llm_result = self.llm.generate_structured_output(prompt)
+                action = llm_result.get("action")
+                initial_generated_text = llm_result.get("text") # Renamed for clarity
+                final_generated_text_for_dispatch = initial_generated_text # Start with the initial version
 
                 # Contextual Search and Refinement for Replies
                 if action == "reply" and initial_generated_text: # Check initial_generated_text before proceeding
@@ -319,7 +175,7 @@ class XVioletAgent:
                             except Exception as e_vs_search_reply:
                                 logger.error(f"Error searching vector store for reply context: {e_vs_search_reply}", exc_info=True)
                     
-                    if reply_context_documents and self.llm and hasattr(self.llm, 'providers') and self.llm.providers: # Check if llm is available
+                    if reply_context_documents and self.llm and self.llm.is_enabled: # Check if llm is available
                         context_snippets = [doc.get('text', '') for doc in reply_context_documents if doc.get('text', '').strip()]
                         if context_snippets:
                             formatted_reply_context = "Contextual Information:\n" + "\n---\n".join(context_snippets)
@@ -351,7 +207,7 @@ class XVioletAgent:
                                 logger.error(f"Error during reply refinement LLM call: {e_refine}. Using original draft.", exc_info=True)
                         else:
                             logger.info("No usable text snippets from context documents for reply refinement.")
-                    elif not (self.llm and hasattr(self.llm, 'providers') and self.llm.providers):
+                    elif not (self.llm and self.llm.is_enabled):
                         logger.warning("LLM manager not available or not enabled, skipping reply refinement.")
 
                 # 4. Dispatch action (quote, reply, like, retweet)
@@ -418,170 +274,20 @@ class XVioletAgent:
             
             # Post generation at configured interval
             if self.config.enable_twitter_post_generation and now >= next_post:
-                logger.info("Starting post generation and scheduling cycle...")
-                
-                # Contextual Search Query for New Tweets
-                if self.vector_store_manager:
-                    query_text_for_new_tweet = "general relevant topics for social media" # Default
-                    if self.persona and hasattr(self.persona, 'interests') and self.persona.interests:
-                        # Ensure random is imported if not already at top of file
-                        # import random # Should be at top of file
-                        query_text_for_new_tweet = random.choice(self.persona.interests)
-                        logger.info(f"New tweet context: Using persona interest '{query_text_for_new_tweet}' for vector search.")
-                    else:
-                        logger.info(f"New tweet context: Persona interests not available or empty, using default query '{query_text_for_new_tweet}'.")
-
+                logger.info("Agent: Initiating tweet scheduling cycle via Scheduler.")
+                if self.scheduler and self.llm and self.llm.is_enabled: # Ensure LLM is also enabled
                     try:
-                        logger.debug(f"Searching vector store with query for new tweet context: '{query_text_for_new_tweet}'")
-                        retrieved_docs_for_new_tweet = self.loop.run_until_complete(
-                            self.vector_store_manager.search(query_embedding=query_text_for_new_tweet, top_k=3)
-                        )
-                        if retrieved_docs_for_new_tweet:
-                            logger.info(f"Retrieved {len(retrieved_docs_for_new_tweet)} docs from VS for new tweet query '{query_text_for_new_tweet}':")
-                            for doc_vs in retrieved_docs_for_new_tweet:
-                                logger.info(f"  - ID: {doc_vs.get('id')}, Score: {doc_vs.get('score')}, Text: {doc_vs.get('text', '')[:100]}...")
-                            self.current_new_tweet_context_docs = retrieved_docs_for_new_tweet
-                        else:
-                            logger.info(f"No documents found in VS for new tweet query: '{query_text_for_new_tweet}'")
-                            self.current_new_tweet_context_docs = [] 
-                    except Exception as e_vs_search_new:
-                        logger.error(f"Error searching vector store for new tweet context: {e_vs_search_new}", exc_info=True)
-                        self.current_new_tweet_context_docs = []
-                else:
-                    logger.info("Vector store manager not available, skipping context search for new tweets.")
-                    self.current_new_tweet_context_docs = []
-
-                scheduled_in_cycle_count = 0
-                media_scheduled_in_cycle_count = 0
+                        # The vector store search for context and the main scheduling loop
+                        # are now inside self.scheduler.run_schedule_cycle()
+                        num_scheduled = self.loop.run_until_complete(self.scheduler.run_schedule_cycle())
+                        logger.info(f"Agent: Scheduler completed cycle. Scheduled {num_scheduled} tweets.")
+                    except Exception as e_scheduler_cycle:
+                        logger.error(f"Agent: Error during scheduler cycle: {e_scheduler_cycle}", exc_info=True)
+                elif not self.llm or not self.llm.is_enabled:
+                    logger.warning("Agent: LLM is not available or not enabled. Skipping scheduling cycle.")
+                else: # self.scheduler is None
+                    logger.error("Agent: Scheduler not initialized. Skipping scheduling cycle.")
                 
-                # query_text_for_new_tweet is defined above this block and holds the topic used for VS search
-
-                for _ in range(self.config.max_scheduled_tweets_total): # Iterate up to total allowed, not from scheduled_in_cycle_count
-                    if scheduled_in_cycle_count >= self.config.max_scheduled_tweets_total:
-                        logger.info(f"Reached max_scheduled_tweets_total ({self.config.max_scheduled_tweets_total}) for this cycle.")
-                        break
-
-                    selected_media_path = None
-                    text_content = None # Reset for each potential tweet
-                    is_media_attempt = False
-
-                    # Prepare context string from docs retrieved earlier
-                    formatted_context = ""
-                    if hasattr(self, 'current_new_tweet_context_docs') and self.current_new_tweet_context_docs:
-                        context_snippets = [doc.get('text', '') for doc in self.current_new_tweet_context_docs if doc.get('text', '').strip()]
-                        if context_snippets:
-                            formatted_context = "Contextual Information:\n" + "\n---\n".join(context_snippets) + "\n\n"
-                            logger.debug(f"Using formatted context for LLM prompt: {formatted_context[:200]}...")
-                        else:
-                            logger.debug("current_new_tweet_context_docs was present but yielded no usable snippets.")
-                    else:
-                        logger.debug("No current_new_tweet_context_docs to use for LLM prompt.")
-
-
-                    # Determine if a media tweet should be generated
-                    if media_scheduled_in_cycle_count < self.config.max_scheduled_media_tweets and \
-                       random.random() < self.config.media_tweet_probability:
-                        is_media_attempt = True
-                        logger.info("Attempting to schedule a media tweet.")
-                        media_dir = Path(self.config.media_dir)
-                        if media_dir.exists() and media_dir.is_dir():
-                            available_media_files = [
-                                p for p in media_dir.iterdir() 
-                                if p.is_file() and p.suffix.lower() in ('.jpg', '.jpeg', '.png', '.gif')
-                            ]
-                            
-                            unused_media_files = [
-                                p for p in available_media_files 
-                                if not is_media_used(os.path.basename(str(p)), self.used_media_set)
-                            ]
-
-                            if unused_media_files:
-                                selected_media_path = str(random.choice(unused_media_files))
-                                logger.info(f"Selected unused media: {selected_media_path}")
-                                try:
-                                    base_caption_prompt = "Analyze the following image and generate a tweet caption for it, reflecting your persona."
-                                    prompt_for_image_analysis = f"{formatted_context}Based on the context above (if any) and your persona, analyze the image and generate a suitable tweet caption:" if formatted_context else base_caption_prompt
-                                    
-                                    try:
-                                        text_content = self.loop.run_until_complete(
-                                            self.llm.analyze_image(
-                                                image_path=selected_media_path, 
-                                                context_type="post",
-                                                prompt_override=prompt_for_image_analysis
-                                            )
-                                        )
-                                        if not text_content:
-                                            logger.error(f"LLM failed to generate caption for media {selected_media_path}. Skipping this media tweet slot.")
-                                            continue  # Skip to next iteration if no content generated
-                                    except Exception as e:
-                                        logger.error(f"Error during LLM image analysis for {selected_media_path}: {e}", exc_info=True)
-                                        continue  # Skip to next iteration on error
-                                except Exception as e:
-                                    logger.error(f"Error during LLM caption generation for media {selected_media_path}: {e}. Skipping this media tweet slot.", exc_info=True)
-                                    text_content = None 
-                            else:
-                                logger.info("No unused image media found for a media tweet attempt.")
-                                is_media_attempt = False 
-                        else:
-                            logger.warning(f"Media directory {self.config.media_dir} not found or not a directory. Skipping media tweet attempt.")
-                            is_media_attempt = False
-                    
-                    # Generate text-only tweet if not a media attempt OR if media attempt failed to secure a path
-                    if not is_media_attempt: 
-                        logger.info("Attempting to schedule a text-only tweet.")
-                        base_topic_for_llm = query_text_for_new_tweet # Use the topic from VS search
-                        prompt_for_text_generation = f"Based on your persona, generate a tweet about: {base_topic_for_llm}."
-                        if formatted_context:
-                            prompt_for_text_generation = f"{formatted_context}Based on the context above (if any) and your persona, generate a tweet about: {base_topic_for_llm}."
-                        
-                        try:
-                            try:
-                                text_content = self.loop.run_until_complete(
-                                    self.llm.generate_text(prompt=prompt_for_text_generation, context_type="post")
-                                )
-                                if not text_content:
-                                    logger.warning(f"Text generation failed for topic: {base_topic_for_llm}. Skipping this slot.")
-                                    continue  # Skip to next iteration if no content generated
-                            except Exception as e:
-                                logger.error(f"Error during text generation for topic '{base_topic_for_llm}': {e}", exc_info=True)
-                                continue  # Skip to next iteration on error
-                        except Exception as e:
-                            logger.error(f"Error during text generation for topic '{base_topic_for_llm}': {e}", exc_info=True)
-                            text_content = None 
-
-                    # Schedule the tweet if text_content was successfully generated
-                    if text_content: # This condition now correctly skips if media analysis failed
-                        try:
-                            # If it was a media attempt but text_content is None (due to LLM failure for media),
-                            # selected_media_path might still be set. We should only schedule if text_content is valid.
-                            # The only way text_content is set for a media attempt is if LLM succeeded.
-                            # If it's a text-only attempt, selected_media_path is None.
-                            
-                            current_media_to_schedule = selected_media_path if is_media_attempt and text_content else None
-
-                            self.loop.run_until_complete(
-                                self.twitter.schedule_tweet_from_agent(text=text_content, media_path=current_media_to_schedule)
-                            )
-                            logger.info(f"Successfully called schedule_tweet_from_agent for text: '{text_content[:50]}...' media: {current_media_to_schedule}")
-                            scheduled_in_cycle_count += 1
-
-                            if current_media_to_schedule: # Only if it was a successful media tweet
-                                media_filename = os.path.basename(current_media_to_schedule)
-                                mark_media_as_used(media_filename)
-                                self.used_media_set.add(media_filename)
-                                media_scheduled_in_cycle_count += 1
-                                logger.info(f"Marked media {media_filename} as used. Total media scheduled this cycle: {media_scheduled_in_cycle_count}")
-                        except Exception as e:
-                            logger.error(f"Error scheduling tweet (text: '{text_content[:50]}...', media: {current_media_to_schedule}): {e}")
-                    elif is_media_attempt and not text_content:
-                        # This is the case where media analysis failed, and we logged an error.
-                        # We explicitly do nothing more for this slot.
-                        logger.info(f"Skipping scheduling for slot due to earlier media content generation failure for {selected_media_path}.")
-                    else:
-                        # This handles cases where text generation for a text-only tweet failed.
-                        logger.info("No text_content available for this slot (e.g. text generation failed), nothing to schedule.")
-                
-                logger.info(f"Finished scheduling cycle. Total scheduled: {scheduled_in_cycle_count}, Media scheduled: {media_scheduled_in_cycle_count}.")
                 next_post = now + random.uniform(self.config.post_interval_min, self.config.post_interval_max)
             sleep_interval = random.uniform(
                 self.config.loop_sleep_interval_min,
