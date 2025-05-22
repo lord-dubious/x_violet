@@ -111,6 +111,10 @@ class AgentConfig:
             default = float(os.getenv("LOOP_SLEEP_INTERVAL", "1"))
             self.loop_sleep_interval_min = default
             self.loop_sleep_interval_max = default
+        
+        # --- Scheduled Tweet Limits ---
+        self.max_scheduled_tweets_total = int(os.getenv("MAX_SCHEDULED_TWEETS_TOTAL", "5"))
+        self.max_scheduled_media_tweets = int(os.getenv("MAX_SCHEDULED_MEDIA_TWEETS", "2"))
 
     def _to_bool(self, value: str) -> bool:
         return value.strip().lower() in ("1", "true", "yes", "on")
