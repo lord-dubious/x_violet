@@ -28,15 +28,46 @@ class AgentConfig:
             'name': 'local_default',
             'type': 'local',
             'config': {'db_path': os.getenv("LOCAL_VECTOR_DB_PATH", DEFAULT_LOCAL_DB_PATH)}
-        },
-        # { # Example of a disabled remote store configuration for structure demonstration
-        #     'name': 'remote_disabled_placeholder',
-        #     'type': 'remote',
-        #     'enabled': False, 
-        #     'config': {'api_key': os.getenv("REMOTE_VECTOR_STORE_API_KEY", "YOUR_REMOTE_API_KEY_HERE_OR_ENV"), 
-        #                'index_name': 'default_placeholder_index'}
-        # }
+        }
     ]
+
+    # --- Default LLM Provider Configurations ---
+    DEFAULT_GEMINI_CONFIG = {
+        'name': 'default_gemini', 'type': 'gemini', 'enabled': True,
+        'config': {
+            'api_key': os.getenv("GEMINI_API_KEY", ""), # Will use self.gemini_api_key if empty
+            'text_model_name': os.getenv("GEMINI_TEXT_MODEL", "gemini-pro"),
+            'vision_model_name': os.getenv("GEMINI_VISION_MODEL", "gemini-pro-vision"),
+            # 'persona_object': self.persona_instance # Placeholder, persona init is later
+        }
+    }
+    DEFAULT_LITELLM_CONFIG = {
+        'name': 'default_litellm', 'type': 'litellm', 'enabled': False, # Disabled by default
+        'config': {
+            'model': os.getenv("LITELLM_MODEL", "gpt-3.5-turbo"), 
+            'api_key': os.getenv("LITELLM_API_KEY", ""), # e.g., OPENAI_API_KEY
+            'api_base': os.getenv("LITELLM_API_BASE", None), # e.g., for custom OpenAI-compatible endpoints
+            'custom_llm_provider': os.getenv("LITELLM_CUSTOM_PROVIDER", None), # e.g., 'ollama' if model is 'ollama/mistral'
+            'default_params': {'temperature': 0.7}
+        }
+    }
+    DEFAULT_LOCAL_GGUF_CONFIG = {
+        'name': 'default_local_gguf', 'type': 'local_gguf', 'enabled': False, # Disabled by default
+        'config': {
+            'model_path': os.getenv("LOCAL_GGUF_MODEL_PATH", "models/gguf/not_a_real_model.gguf"), # Placeholder
+            'n_gpu_layers': int(os.getenv("LOCAL_GGUF_N_GPU_LAYERS", "0")),
+            'n_ctx': int(os.getenv("LOCAL_GGUF_N_CTX", "2048")),
+            'temperature': 0.7, # Default generation param
+            'max_tokens': 512   # Default generation param
+        }
+    }
+    # List of default LLM provider configurations
+    DEFAULT_LLM_PROVIDER_CONFIGS = [
+        DEFAULT_GEMINI_CONFIG, 
+        DEFAULT_LITELLM_CONFIG, 
+        DEFAULT_LOCAL_GGUF_CONFIG
+    ]
+
 
     """
     Centralized config loader for all agent modules.
@@ -141,27 +172,69 @@ class AgentConfig:
         raw_vector_store_configs_json = os.getenv("VECTOR_STORE_CONFIGS_JSON")
         if raw_vector_store_configs_json:
             try:
-                # Attempt to parse the JSON string from the environment variable
-                parsed_configs = json.loads(raw_vector_store_configs_json)
-                if isinstance(parsed_configs, list):
-                    self.vector_store_configs = parsed_configs
+                parsed_vs_configs = json.loads(raw_vector_store_configs_json)
+                if isinstance(parsed_vs_configs, list):
+                    self.vector_store_configs = parsed_vs_configs
                     logger.info(f"Loaded vector store configurations from VECTOR_STORE_CONFIGS_JSON: {self.vector_store_configs}")
                 else:
                     logger.error("VECTOR_STORE_CONFIGS_JSON did not contain a valid JSON list. Using default vector store configuration.")
-                    self.vector_store_configs = list(self.DEFAULT_VECTOR_STORE_CONFIGS) # Use a copy
+                    self.vector_store_configs = list(self.DEFAULT_VECTOR_STORE_CONFIGS) 
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid JSON in VECTOR_STORE_CONFIGS_JSON: {e}. Using default vector store configuration.")
-                self.vector_store_configs = list(self.DEFAULT_VECTOR_STORE_CONFIGS) # Use a copy
+                self.vector_store_configs = list(self.DEFAULT_VECTOR_STORE_CONFIGS)
         else:
             logger.info("VECTOR_STORE_CONFIGS_JSON not set. Using default vector store configuration.")
-            self.vector_store_configs = list(self.DEFAULT_VECTOR_STORE_CONFIGS) # Use a copy
+            self.vector_store_configs = list(self.DEFAULT_VECTOR_STORE_CONFIGS)
 
-        # Ensure there's at least one config, or log a warning if it's empty after processing.
-        # This might happen if JSON is `[]`.
-        if not self.vector_store_configs:
-            logger.warning("No vector store configurations loaded or defined. Vector store functionality may be limited.")
-            # Optionally, re-add defaults if empty list from JSON is considered invalid.
-            # self.vector_store_configs = list(self.DEFAULT_VECTOR_STORE_CONFIGS)
+        if not self.vector_store_configs: # Check after attempting to load/default
+            logger.warning("No vector store configurations available after processing. Vector store functionality may be impaired.")
+
+        # --- LLM Provider Configurations ---
+        # Update default Gemini config with potentially already loaded API key
+        # This needs to be dynamic if self.gemini_api_key is set earlier.
+        # For simplicity, GeminiLLMProvider itself can fall back to self.gemini_api_key from global config if not in its own dict.
+        # Or, we ensure that the 'api_key' in DEFAULT_GEMINI_CONFIG correctly uses the loaded self.gemini_api_key.
+        # Let's adjust DEFAULT_GEMINI_CONFIG to use self.gemini_api_key.
+        # This requires DEFAULT_GEMINI_CONFIG to be defined *inside* __init__ or updated after self.gemini_api_key is set.
+        # For class attribute definition, we can't directly use self.gemini_api_key.
+        # So, we'll update the 'api_key' for the default gemini config if it's used.
+
+        default_gemini_provider_cfg = {
+            'name': 'default_gemini', 'type': 'gemini', 'enabled': True,
+            'config': {
+                'api_key': self.gemini_api_key, # Use the potentially loaded API key
+                'text_model_name': self.small_model, # Use general model settings
+                'vision_model_name': self.vision_model,
+                # 'persona_object': self.persona_instance # Persona instance created later by agent
+            }
+        }
+        # Reconstruct the full default list with the updated Gemini config
+        current_default_llm_provider_configs = [
+            default_gemini_provider_cfg,
+            self.DEFAULT_LITELLM_CONFIG, # These are class attributes, access via self or AgentConfig
+            self.DEFAULT_LOCAL_GGUF_CONFIG
+        ]
+
+
+        raw_llm_configs_json = os.getenv("LLM_PROVIDER_CONFIGS_JSON")
+        if raw_llm_configs_json:
+            try:
+                loaded_llm_configs = json.loads(raw_llm_configs_json)
+                if isinstance(loaded_llm_configs, list):
+                    self.llm_provider_configs = loaded_llm_configs
+                    logger.info(f"Loaded LLM provider configurations from LLM_PROVIDER_CONFIGS_JSON: {self.llm_provider_configs}")
+                else:
+                    logger.error("LLM_PROVIDER_CONFIGS_JSON is not a valid JSON list. Using dynamically constructed defaults.")
+                    self.llm_provider_configs = list(current_default_llm_provider_configs)
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in LLM_PROVIDER_CONFIGS_JSON: {e}. Using dynamically constructed default LLM configurations.")
+                self.llm_provider_configs = list(current_default_llm_provider_configs)
+        else:
+            logger.info("LLM_PROVIDER_CONFIGS_JSON not set. Using dynamically constructed default LLM configurations.")
+            self.llm_provider_configs = list(current_default_llm_provider_configs)
+        
+        if not self.llm_provider_configs:
+            logger.warning("No LLM provider configurations available after processing. LLM functionality will be impaired.")
 
 
     def _to_bool(self, value: str) -> bool:

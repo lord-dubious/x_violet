@@ -13,23 +13,49 @@ from xviolet.config import config
 from xviolet.provider.llm import LLMManager
 from xviolet.actions import ActionManager
 from xviolet.client.twitter_client import TwitterClient
-from xviolet.media_tracker import load_used_media, mark_media_as_used, is_media_used # Added media_tracker imports
-from xviolet.vector.fallback_manager import VectorStoreFallbackManager # Added VDB Manager import
+from xviolet.media_tracker import load_used_media, mark_media_as_used, is_media_used
+from xviolet.vector.fallback_manager import VectorStoreFallbackManager
+from xviolet.persona import Persona # ADDED Persona import
 
 logger = logging.getLogger("xviolet.agent")
 
 class XVioletAgent:
     def __init__(self):
         self.config = config
-        self.llm = LLMManager()
+        # self.llm = LLMManager() # LLMManager will be initialized later with provider configs
         self.twitter = TwitterClient()
         self.actions = ActionManager(self.twitter)
-        self.used_media_set = load_used_media() # Initialize used_media_set
-        
+        self.used_media_set = load_used_media()
+        self.current_new_tweet_context_docs = [] # Initialize context attribute
+
+        # Load Persona
+        self.persona: Optional[Persona] = None
+        if self.config.character_file and os.path.exists(self.config.character_file):
+            try:
+                self.persona = Persona(self.config.character_file)
+                logger.info(f"Persona loaded successfully from {self.config.character_file}")
+            except Exception as e:
+                logger.error(f"Failed to load persona from {self.config.character_file}: {e}", exc_info=True)
+        else:
+            logger.warning(f"Persona file not configured or not found: {self.config.character_file}. Proceeding without persona.")
+
+        # Initialize LLMManager (now LLMFallbackManager)
+        # This was deferred from the original plan, but it's better to have it here.
+        # The agent's LLMManager should use the LLM provider configs from AgentConfig.
+        from xviolet.llm.fallback_manager import LLMFallbackManager as LLMManager_Fallback # Alias to avoid name clash
+        try:
+            logger.info("Initializing LLMFallbackManager...")
+            # AgentConfig stores the list of dicts in self.config.llm_provider_configs
+            self.llm = LLMManager_Fallback(llm_provider_configs=self.config.llm_provider_configs)
+            logger.info("LLMFallbackManager initialized successfully.")
+            if not self.llm.is_enabled: # Check if any providers were actually loaded
+                 logger.warning("LLMFallbackManager has no enabled providers. LLM functionality will be offline.")
+        except Exception as e:
+            logger.error(f"Failed to initialize LLMFallbackManager: {e}", exc_info=True)
+            self.llm = None # Set to None if initialization fails
+
         try:
             logger.info("Initializing VectorStoreFallbackManager...")
-            # AgentConfig stores the list of dicts in self.config.vector_store_configs
-            # The manager expects a dict with 'store_configs_list' key
             manager_init_config = {'store_configs_list': self.config.vector_store_configs}
             self.vector_store_manager = VectorStoreFallbackManager(manager_init_config)
             logger.info("VectorStoreFallbackManager initialized successfully.")
@@ -37,11 +63,10 @@ class XVioletAgent:
             logger.error(f"Failed to initialize VectorStoreFallbackManager: {e}", exc_info=True)
             self.vector_store_manager = None 
 
-        # Use dedicated event loop to avoid nested asyncio.run issues
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
 
-    async def run_once(self): # MODIFIED: Changed to async def
+    async def run_once(self):
         # 1. Fetch timeline/tweets to consider
         # Authenticate before polling - login() is async, so await it
         await self.twitter.login() # MODIFIED: Direct await
@@ -108,18 +133,40 @@ class XVioletAgent:
                 # 3. Ask LLM to select action and generate text (if needed)
                 llm_result = self.llm.generate_structured_output(prompt)
                 action = llm_result.get("action")
-                generated_text = llm_result.get("text")
+                generated_text = llm_result.get("text") # Initial reply/action text
 
+                # Contextual Search for Replies
+                if action == "reply" and generated_text and self.vector_store_manager:
+                    original_tweet_text = processed_tweet_data.get('text')
+                    if original_tweet_text:
+                        try:
+                            logger.info(f"Reply action: Searching vector store for context related to: '{original_tweet_text[:100]}...'")
+                            # VectorStoreFallbackManager.search expects query_embedding.
+                            # If it's text, it handles it for LocalVectorStore.
+                            context_docs = await self.vector_store_manager.search(query_embedding=original_tweet_text, top_k=3)
+                            if context_docs:
+                                logger.info(f"Retrieved {len(context_docs)} context documents for reply:")
+                                for doc in context_docs:
+                                    logger.info(f"  - ID: {doc.get('id')}, Score: {doc.get('score')}, Text: {doc.get('text', '')[:100]}...")
+                                # Store context_docs, e.g., self.current_reply_context = context_docs
+                                # For now, just logging. This context would be used in a subsequent step
+                                # to refine `generated_text` before dispatching.
+                            else:
+                                logger.info("No context documents found for this reply.")
+                        except Exception as e_vs_search_reply:
+                            logger.error(f"Error searching vector store for reply context: {e_vs_search_reply}", exc_info=True)
+                
                 # 4. Dispatch action (quote, reply, like, retweet)
+                # Note: generated_text might be refined in a future step using context_docs before this dispatch.
                 self.actions.dispatch(
                     action=action,
-                    tweet_id=processed_tweet_data['id'], # Use ID from processed data
+                    tweet_id=processed_tweet_data['id'], 
                     text=generated_text,
-                    media_path=processed_tweet_data['media_path'], # Use media_path from processed data
-                    conversation=processed_tweet_data['conversation'] # Use conversation flag from processed data
+                    media_path=processed_tweet_data['media_path'], 
+                    conversation=processed_tweet_data['conversation'] 
                 )
 
-                # Add processed tweet to vector store
+                # Add processed tweet to vector store (original tweet being replied to, or any other processed tweet)
                 if self.vector_store_manager and processed_tweet_data.get('id') and processed_tweet_data.get('text'):
                     try:
                         document_to_add = {
@@ -174,27 +221,38 @@ class XVioletAgent:
             
             # Post generation at configured interval
             if self.config.enable_twitter_post_generation and now >= next_post:
-                logger.info("Starting post generation and scheduling cycle...") # Log tweaked in example, kept as is.
+                logger.info("Starting post generation and scheduling cycle...")
                 
-                # POC: Vector Store Search (before individual tweet generation loop)
+                # Contextual Search Query for New Tweets
                 if self.vector_store_manager:
-                    poc_query_text = "relevant context for new tweets" 
+                    query_text_for_new_tweet = "general relevant topics for social media" # Default
+                    if self.persona and hasattr(self.persona, 'interests') and self.persona.interests:
+                        # Ensure random is imported if not already at top of file
+                        # import random # Should be at top of file
+                        query_text_for_new_tweet = random.choice(self.persona.interests)
+                        logger.info(f"New tweet context: Using persona interest '{query_text_for_new_tweet}' for vector search.")
+                    else:
+                        logger.info(f"New tweet context: Persona interests not available or empty, using default query '{query_text_for_new_tweet}'.")
+
                     try:
-                        logger.debug(f"Searching vector store with POC query: '{poc_query_text}'")
-                        # Wrap async search call for sync loop
-                        retrieved_docs = self.loop.run_until_complete(
-                            # For LocalVectorStore, query_text is passed directly.
-                            # For FallbackManager, search method handles the text query for local store.
-                            self.vector_store_manager.search(query_embedding=poc_query_text, top_k=2)
+                        logger.debug(f"Searching vector store with query for new tweet context: '{query_text_for_new_tweet}'")
+                        retrieved_docs_for_new_tweet = self.loop.run_until_complete(
+                            self.vector_store_manager.search(query_embedding=query_text_for_new_tweet, top_k=3)
                         )
-                        if retrieved_docs:
-                            logger.info(f"Retrieved {len(retrieved_docs)} docs from VS for POC query '{poc_query_text}':")
-                            for doc_vs in retrieved_docs:
+                        if retrieved_docs_for_new_tweet:
+                            logger.info(f"Retrieved {len(retrieved_docs_for_new_tweet)} docs from VS for new tweet query '{query_text_for_new_tweet}':")
+                            for doc_vs in retrieved_docs_for_new_tweet:
                                 logger.info(f"  - ID: {doc_vs.get('id')}, Score: {doc_vs.get('score')}, Text: {doc_vs.get('text', '')[:100]}...")
+                            self.current_new_tweet_context_docs = retrieved_docs_for_new_tweet
                         else:
-                            logger.info(f"No documents found in VS for POC query: '{poc_query_text}'")
-                    except Exception as e_vs_search:
-                        logger.error(f"Error searching vector store during POC: {e_vs_search}", exc_info=True)
+                            logger.info(f"No documents found in VS for new tweet query: '{query_text_for_new_tweet}'")
+                            self.current_new_tweet_context_docs = [] 
+                    except Exception as e_vs_search_new:
+                        logger.error(f"Error searching vector store for new tweet context: {e_vs_search_new}", exc_info=True)
+                        self.current_new_tweet_context_docs = []
+                else:
+                    logger.info("Vector store manager not available, skipping context search for new tweets.")
+                    self.current_new_tweet_context_docs = []
 
                 scheduled_in_cycle_count = 0
                 media_scheduled_in_cycle_count = 0
